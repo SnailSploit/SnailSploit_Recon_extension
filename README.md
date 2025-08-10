@@ -22,3 +22,5 @@
 - For security research & recon. Respect target policies and laws.
 
 **Built with ❤️ for the SnailSploit red team community.**
+
+<img width="612" height="606" alt="image" src="https://github.com/user-attachments/assets/1ec45fbc-e1f0-4a77-97d9-d62db2ee4560" />
