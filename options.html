@@ -1,0 +1,13 @@
+
+<!doctype html><html><head><meta charset="utf-8"><title>ReconRadar – Options</title>
+<style>body{font:14px system-ui;max-width:720px;margin:24px auto;padding:0 12px}input[type=text]{width:520px;padding:6px}.btn{padding:6px 10px;border:1px solid #222;border-radius:6px;background:#111;color:#fff;cursor:pointer}</style></head>
+<body>
+<h2>ReconRadar Lite – Options</h2>
+<label>VirusTotal API key: <input id="vt" type="text" placeholder="vt_public_or_premium_key"/></label>
+<div style="margin-top:8px">
+<button id="save" class="btn">Save</button>
+<button id="clear" class="btn" style="margin-left:8px;background:#444">Clear</button>
+</div>
+<p>You can also provide a default via <code>config.json</code> with <code>{ "vtApiKey": "..." }</code>. Local storage overrides it.</p>
+<script src="options.js"></script>
+</body></html>

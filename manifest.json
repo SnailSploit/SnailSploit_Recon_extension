@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "SnailSploit Recon Extension",
+  "version": "0.8.0",
+  "description": "SnailSploit Recon: instant site recon with layered fallbacks (headers, IP/CVEs, subdomains, secrets, tech). Stable-safe (no chrome.dns).",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "*://*/*",
+    "https://internetdb.shodan.io/*",
+    "https://dns.google/resolve*",
+    "https://cloudflare-dns.com/*",
+    "https://ipwho.is/*",
+    "https://ipapi.co/*",
+    "https://rdap.org/*",
+    "https://crt.sh/*",
+    "https://dns.bufferover.run/*",
+    "https://jldc.me/*",
+    "https://cve.circl.lu/*",
+    "https://services.nvd.nist.gov/*",
+    "https://www.virustotal.com/api/v3/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ]
+}
