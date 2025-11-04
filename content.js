@@ -1,8 +1,11 @@
 
+// Content script - Extracts page resources and DOM hints for security analysis
+// Runs on every page to collect: scripts, meta tags, favicon, and resource paths
 (function(){
   const abs = (u) => { try { return new URL(u, location.href).href; } catch { return null; } };
   const state = { external: new Set(), inline: [], favicon: null, meta: {}, domHints: { paths: [] }, lastSent: 0 };
 
+  // Capture current page state: scripts, meta tags, links, and favicon
   function snapshot(){
     try {
       document.querySelectorAll('script').forEach(s => {
@@ -29,6 +32,7 @@
     } catch {}
   }
 
+  // Send page resources to service worker (throttled to avoid spam)
   function send(throttleMs=500){
     const now = Date.now();
     if (now - state.lastSent < throttleMs) return;

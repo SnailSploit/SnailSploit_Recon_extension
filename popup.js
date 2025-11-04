@@ -2,7 +2,7 @@
 let TAB_ID = null;
 async function getTabId(){ const [t]=await chrome.tabs.query({active:true,currentWindow:true}); return t?.id; }
 function el(html){ const t=document.createElement("template"); t.innerHTML=html.trim(); return t.content.firstChild; }
-function esc(s){ return (s??"").toString().replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function esc(s){ return (s??"").toString().replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 function headerCard(s){
   const fav = (typeof s.faviconHash==="number") ? `<span class="small">favicon mmh3: <code>${s.faviconHash}</code></span>` : "";
@@ -96,6 +96,38 @@ async function render(){
   root.appendChild(textsCard(s));
   root.appendChild(secretsCard(s));
   root.appendChild(subsCard(s));
+  root.appendChild(exportCard(s));
+}
+
+function exportCard(s){
+  const card=el(`<div class="card"><h3>Export</h3><button class="btn" id="exportBtn">Export Results as JSON</button> <button class="btn" id="exportTxtBtn">Export as Text Report</button></div>`);
+  card.querySelector("#exportBtn").addEventListener("click", ()=>{
+    const dataStr = JSON.stringify(s, null, 2);
+    const blob = new Blob([dataStr], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `recon-${s.domain||'report'}-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+  card.querySelector("#exportTxtBtn").addEventListener("click", ()=>{
+    let report = `SnailSploit Recon Report\n${'='.repeat(50)}\n\n`;
+    report += `Domain: ${s.domain||'N/A'}\nURL: ${s.url||'N/A'}\nTimestamp: ${new Date(s.ts||Date.now()).toISOString()}\n\n`;
+    report += `Security Headers:\n${'-'.repeat(30)}\n`;
+    Object.entries(s.headers||{}).forEach(([k,v])=>report+=`${k}: ${v||'missing'}\n`);
+    report += `\nIP Addresses: ${(s.ips||[]).join(', ')}\n`;
+    if(s.quickSubs?.length) report += `\nSubdomains (${s.quickSubs.length}):\n${s.quickSubs.map(x=>x.subdomain).join('\n')}\n`;
+    if(s.secrets?.length) report += `\nSecrets Found: ${s.secrets.length} sources\n`;
+    const blob = new Blob([report], {type: 'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `recon-${s.domain||'report'}-${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+  return card;
 }
 
 (async()=>{

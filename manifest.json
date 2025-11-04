@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SnailSploit Recon Extension",
-  "version": "0.8.0",
-  "description": "SnailSploit Recon: instant site recon with layered fallbacks (headers, IP/CVEs, subdomains, secrets, tech). Stable-safe (no chrome.dns).",
+  "version": "0.9.0",
+  "description": "SnailSploit Recon: instant site recon with layered fallbacks (headers, IP/CVEs, subdomains, secrets, tech). Enhanced security & export features.",
   "permissions": [
     "storage",
     "tabs",
