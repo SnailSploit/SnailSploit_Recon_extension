@@ -1,5 +1,35 @@
 
-function log(...a){ try{ console.log("[ReconRadar]", ...a);}catch{} }
+// Configuration constants
+const CONFIG = {
+  TIMEOUTS: {
+    FETCH_DEFAULT: 3000,
+    FETCH_HEADERS: 2500,
+    FETCH_TEXT: 2500,
+    FETCH_JSON: 3500,
+    FETCH_FAVICON: 2000,
+    DOH_RESOLVE: 2500,
+    SECURITY_TXT: 2000,
+    VT_REQUEST: 3000,
+    CVE_NVD: 4000
+  },
+  LIMITS: {
+    MAX_IPS: 20,
+    MAX_EXTERNAL_SCRIPTS: 12,
+    MAX_INLINE_SCRIPTS: 16,
+    MAX_SECRETS_RESULTS: 20,
+    MAX_SUBDOMAINS: 200,
+    MAX_SUBDOMAINS_LIVE: 80,
+    MAX_SUBDOMAINS_QUEUE: 120,
+    MAX_PARALLEL_WORKERS: 6,
+    MAX_CPES_PER_IP: 5,
+    MAX_CVE_RESULTS: 60,
+    MAX_SOURCE_MAPS: 6,
+    MAX_DKIM_SELECTORS: 6,
+    MAX_DOM_PATHS: 200
+  }
+};
+
+function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
 const merge = (a,b)=>Object.assign({},a||{},b||{});
 
 async function fetchWithTimeout(resource, options={}, ms=3000){
@@ -39,7 +69,8 @@ async function fetchHeadersFallback(url){
   return null;
 }
 
-// DNS (DoH only)
+// DNS resolution via DNS-over-HTTPS (DoH) - Uses Google and Cloudflare public resolvers
+// Avoids chrome.dns API requirement, making extension work on Chrome Stable
 async function dohResolve(name, type){
   const enc = encodeURIComponent(name);
   const urls = [
@@ -68,9 +99,9 @@ async function resolveIPs(hostname){
     `https://cloudflare-dns.com/dns-query?name=${q}&type=A`,
     `https://cloudflare-dns.com/dns-query?name=${q}&type=AAAA`
   ];
-  const all = await Promise.all(urls.map(u => fetchWithTimeout(u, { headers:{accept:"application/dns-json"} }, 2500).then(r=>r.json()).catch(()=>({}))));
+  const all = await Promise.all(urls.map(u => fetchWithTimeout(u, { headers:{accept:"application/dns-json"} }, CONFIG.TIMEOUTS.DOH_RESOLVE).then(r=>r.json()).catch(()=>({}))));
   for (const j of all) for (const a of (j.Answer||[])) if (a.type===1||a.type===28) ips.add(a.data);
-  return [...ips].slice(0, 20);
+  return [...ips].slice(0, CONFIG.LIMITS.MAX_IPS);
 }
 
 // enrichers
@@ -86,7 +117,8 @@ async function checkSPF(d){ try{ const recs=await dohTXT(d); const m=recs.find(r
 const COMMON_DKIM=["default","google","mail","mandrill","dkim","selector","selector1","selector2","s1","s2","k1","mx","smtp"];
 async function checkDKIM(d){ const found=[]; for(const sel of COMMON_DKIM){ try{ const txts=await dohTXT(`${sel}._domainkey.${d}`); const rec=(txts||[]).find(r=>String(r).toLowerCase().includes("v=dkim1")); if(rec) found.push({selector:sel,record:rec}); if(found.length>=6) break; }catch{} } return {selectors:found}; }
 
-// subdomains
+// Subdomain enumeration - Combines passive sources (crt.sh, BufferOver, Anubis)
+// Then performs active DNS resolution to verify live subdomains
 async function subdomainsPassive(domain){
   const set = new Set(); const q=domain.replace(/^\*\./,"");
   try{ const r=await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`,{},2500); if(r.ok){ const t=await r.text(); let arr=[]; try{arr=JSON.parse(t);}catch{arr=t.trim().split("\n").map(x=>{try{return JSON.parse(x)}catch{return null}}).filter(Boolean);} for(const row of arr){ for(const n of String(row.name_value||"").split(/\n+/)) if(n && n.endsWith(q)) set.add(n.replace(/^\*\./,"")); } } }catch{}
@@ -95,42 +127,60 @@ async function subdomainsPassive(domain){
   return [...set].slice(0,200);
 }
 async function subdomainsLive(domain){
-  const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,120); const limit=6;
+  const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
   async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch{} } }
-  await Promise.all(Array.from({length:limit},worker)); return out.slice(0,80);
+  await Promise.all(Array.from({length:limit},worker)); return out.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_LIVE);
 }
 
-// favicon hash
+// Favicon hash - Computes MurmurHash3 (32-bit) of favicon for fingerprinting
+// Used by Shodan and other tools to identify web technologies by favicon signature
 function mmh3_32_from_b64(b64){
   function rotl32(x,r){ return (x<<r)|(x>>> (32-r)); }
   const bin=atob(b64); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
   let h1=0x811c9dc5; const c1=0xcc9e2d51, c2=0x1b873593; const view=new DataView(arr.buffer,arr.byteOffset,arr.byteLength);
   const nblocks=Math.floor(arr.byteLength/4);
+  // Process 4-byte blocks
   for(let i=0;i<nblocks;i++){ let k1=view.getUint32(i*4,true); k1=Math.imul(k1,c1); k1=rotl32(k1,15); k1=Math.imul(k1,c2); h1^=k1; h1=rotl32(h1,13); h1=(Math.imul(h1,5)+0xe6546b64)|0; }
+  // Process remaining bytes
   let k1=0; const tail=arr.byteLength & 3; const p=nblocks*4;
   if(tail===3) k1^=arr[p+2]<<16; if(tail>=2) k1^=arr[p+1]<<8; if(tail>=1){ k1^=arr[p]; k1=Math.imul(k1,c1); k1=rotl32(k1,15); k1=Math.imul(k1,c2); h1^=k1; }
+  // Finalization
   h1^=arr.byteLength; h1^=h1>>>16; h1=Math.imul(h1,0x85ebca6b); h1^=h1>>>13; h1=Math.imul(h1,0xc2b2ae35); h1^=h1>>>16; return (h1|0);
 }
-async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},2000); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
+// Fetches favicon and computes its mmh3 hash for fingerprinting
+async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
 
-// secrets
+// Secrets scanner - Regex patterns to detect exposed credentials, API keys, and sensitive endpoints
+// Includes patterns for AWS, Google, GitHub, Slack, Discord, Telegram, and more
 const SECRET_PATTERNS=[
   {id:"aws_access_key", rx:/AKIA[0-9A-Z]{16}/g},
+  {id:"aws_secret_key", rx:/(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)[\s:=]+[A-Za-z0-9\/\+=]{40}/g},
   {id:"google_api_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
+  {id:"google_oauth", rx:/ya29\.[0-9A-Za-z\-_]+/g},
   {id:"github_pat", rx:/(?:ghp|gho|ghu|ghs)_[A-Za-z0-9]{36}/g},
   {id:"github_fine_grained", rx:/github_pat_[A-Za-z0-9_]{22,}/g},
   {id:"slack_token", rx:/xox[baprs]-[A-Za-z0-9\-]{10,48}/g},
+  {id:"slack_webhook", rx:/https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{8,}\/B[A-Z0-9]{8,}\/[A-Za-z0-9]{24}/g},
   {id:"stripe_key", rx:/(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g},
   {id:"sendgrid_key", rx:/SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}/g},
   {id:"twilio_sid", rx:/AC[a-f0-9]{32}/gi},
+  {id:"twilio_token", rx:/SK[a-f0-9]{32}/gi},
+  {id:"firebase_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
+  {id:"firebase_db", rx:/https:\/\/[a-z0-9\-]+\.firebaseio\.com/gi},
+  {id:"discord_token", rx:/[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g},
+  {id:"discord_webhook", rx:/https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d{17,19}\/[A-Za-z0-9_\-]{68}/g},
+  {id:"telegram_bot", rx:/\b\d{8,10}:[A-Za-z0-9_\-]{35}\b/g},
   {id:"jwt", rx:/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g},
-  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----/g},
+  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----/g},
   {id:"gcp_sa", rx:/[a-z0-9\-]{6,}\@[a-z0-9\-]+\.iam\.gserviceaccount\.com/g},
   {id:"s3_url", rx:/https?:\/\/[a-z0-9\.\-]{3,}\.s3\.amazonaws\.com\/[^\s"'<>()]+/gi},
   {id:"azure_sas", rx:/(?:sig=)[A-Za-z0-9%]{20,}&(?:se=|\bsv=)/g},
+  {id:"heroku_key", rx:/[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/gi},
+  {id:"mailgun_key", rx:/key-[0-9a-zA-Z]{32}/g},
+  {id:"paypal_braintree", rx:/access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}/g},
   {id:"internal_ip", rx:/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g},
   {id:"endpoint_url", rx:/https?:\/\/[a-z0-9\.\-]+(?::\d{2,5})?(?:\/[A-Za-z0-9_\-\.~%\/\?\=\&#]+)?/gi},
-  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v1|v2|graphql|admin|internal)\/[A-Za-z0-9_\-\/\.]+/gi},
+  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v1|v2|v3|graphql|admin|internal)\/[A-Za-z0-9_\-\/\.]+/gi},
   {id:"api_key_assign", rx:/(?:api[_-]?key|token|secret|bearer)\s*[:=]\s*["'][^"']{12,}["']/gi}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
@@ -160,7 +210,8 @@ async function vtDomain(domain, apiKey){
   if(!r.ok) throw new Error(`VirusTotal HTTP ${r.status}`); const j=await r.json(); const a=j?.data?.attributes||{}; return { reputation:a.reputation??0, last_analysis_stats:a.last_analysis_stats||null, categories:a.categories||null };
 }
 
-// CVE enrichment
+// CVE enrichment - Converts CPEs (Common Platform Enumeration) from Shodan to CVE IDs with severity scores
+// Uses CIRCL.lu API (primary) with NVD (fallback) for CVE lookups
 const cveCache=new Map();
 function normCVE(items){ const out=[]; for(const it of items||[]){ if(!it) continue; let id = it.id || it.cve?.id || it.cve?.CVE_data_meta?.ID || it.cveId || it.cve?.cveId; if(!id) continue; let score=null, severity=null, published=null, lastModified=null; if("cvss" in it) score=Number(it.cvss)||null; if(typeof it.severity==="string") severity=it.severity; if("Published" in it) published=it.Published; if("Modified" in it) lastModified=it.Modified; const nvd = it.cve || it; try{ const m=nvd.metrics||{}; const v31=m.cvssMetricV31?.[0]?.cvssData; const v30=m.cvssMetricV30?.[0]?.cvssData; const v2=m.cvssMetricV2?.[0]?.cvssData; const pick=v31||v30||v2; if(pick && pick.baseScore!=null){ score=Number(pick.baseScore); severity=pick.baseSeverity||severity; } published=nvd.published||nvd.publishedDate||published; lastModified=nvd.lastModified||nvd.lastModifiedDate||lastModified; }catch{} out.push({id,score,severity,published,lastModified}); } return out; }
 async function cveFromCIRCL(cpe){ try{ const j=await fetchJSON(`https://cve.circl.lu/api/search/cpe/${encodeURIComponent(cpe)}`); return normCVE(j).map(x=>({...x,source:"circl"})); }catch{ return []; } }
