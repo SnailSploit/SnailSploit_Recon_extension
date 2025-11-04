@@ -2,6 +2,69 @@
 
 All notable changes to SnailSploit Recon Extension will be documented in this file.
 
+## [1.1.0] - 2025-11-04 - AI-POWERED RECON 🤖
+
+### 🤖 AI Integration with OpenAI
+
+**Intelligent Host Filtering**
+- AI-powered filtering of passive subdomain reconnaissance results
+- Automatically identifies relevant hosts vs noise (CDN, cache, test domains)
+- Prioritizes production services, APIs, auth endpoints, internal infrastructure
+- Smart filtering reduces 100+ hosts down to 10-20 truly relevant targets
+
+**AI Correlation & Security Analysis**
+- Automated correlation of all reconnaissance findings
+- Security posture assessment (headers, email security, exposed services)
+- Attack surface analysis with entry point identification
+- Technology stack insights and pattern detection
+- Actionable recommendations for further investigation
+- Markdown-formatted analysis in popup UI
+
+**Technical Implementation**
+- OpenAI GPT-4o-mini integration for cost-effectiveness
+- Background processing - doesn't block other reconnaissance
+- Graceful degradation if no API key provided
+- Configurable via Options page
+- API key stored securely in chrome.storage.local
+
+**New UI Components**
+- 🤖 "AI Correlation & Insights" card with security analysis
+- 🎯 "AI-Filtered Relevant Hosts" card with smart subdomain list
+- OpenAI API key configuration field in Options page
+- Real-time status indicators during AI processing
+
+### 📊 Enhanced User Experience
+
+**Export Functionality**
+- Export all reconnaissance results as JSON
+- Export as formatted text report
+- One-click download with timestamp
+- Preserves all findings including IPs, CVEs, secrets, tech stack
+
+**Configuration**
+- Updated options.html with OpenAI API key input
+- Enhanced options.js to save/load OpenAI credentials
+- config.json template includes openaiApiKey field
+
+### 🔧 Technical Details
+
+**New Functions in sw.js**
+- `callOpenAI()` - OpenAI API wrapper with error handling
+- `filterHostsWithAI()` - Intelligent subdomain filtering
+- `correlateFindings()` - Comprehensive security analysis
+- 15-second timeout for AI operations
+- Comprehensive error logging and fallback behavior
+
+**Popup UI Enhancements**
+- `aiCorrelationCard()` - Renders markdown analysis
+- `aiEnhancedSubsCard()` - Displays filtered hosts with IPs
+- `exportCard()` - JSON and text export buttons
+- Enhanced card rendering with proper formatting
+
+**Updated Permissions**
+- Added `https://api.openai.com/*` to host_permissions
+- Maintains all existing security and reconnaissance capabilities
+
 ## [1.0.0] - 2025-11-04 - PRODUCTION READY 🚀
 
 ### 🔥 Major Enhancements - WAY MORE FINDINGS
