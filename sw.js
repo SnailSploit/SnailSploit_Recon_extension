@@ -1,16 +1,18 @@
 
-// Configuration constants
+// Configuration constants - More generous timeouts for robustness
 const CONFIG = {
   TIMEOUTS: {
-    FETCH_DEFAULT: 3000,
-    FETCH_HEADERS: 2500,
-    FETCH_TEXT: 2500,
-    FETCH_JSON: 3500,
-    FETCH_FAVICON: 2000,
-    DOH_RESOLVE: 2500,
-    SECURITY_TXT: 2000,
-    VT_REQUEST: 3000,
-    CVE_NVD: 4000
+    FETCH_DEFAULT: 8000,      // Increased from 3000
+    FETCH_HEADERS: 5000,      // Increased from 2500
+    FETCH_TEXT: 6000,         // Increased from 2500
+    FETCH_JSON: 8000,         // Increased from 3500
+    FETCH_FAVICON: 4000,      // Increased from 2000
+    DOH_RESOLVE: 5000,        // Increased from 2500
+    SECURITY_TXT: 4000,       // Increased from 2000
+    VT_REQUEST: 8000,         // Increased from 3000
+    CVE_NVD: 10000,           // Increased from 4000
+    SUBDOMAIN_PASSIVE: 8000,  // New
+    IP_ENRICHMENT: 8000       // New
   },
   LIMITS: {
     MAX_IPS: 20,
@@ -26,11 +28,37 @@ const CONFIG = {
     MAX_SOURCE_MAPS: 6,
     MAX_DKIM_SELECTORS: 6,
     MAX_DOM_PATHS: 200
+  },
+  RETRY: {
+    MAX_ATTEMPTS: 3,
+    INITIAL_DELAY: 500,
+    MAX_DELAY: 4000
   }
 };
 
 function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
+function logError(...a){ try{ console.error("[SnailSploit Recon ERROR]", ...a);}catch{} }
 const merge = (a,b)=>Object.assign({},a||{},b||{});
+
+// Exponential backoff retry helper
+async function retryWithBackoff(fn, maxAttempts = CONFIG.RETRY.MAX_ATTEMPTS, operation = "operation") {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts) {
+        logError(`${operation} failed after ${maxAttempts} attempts:`, error);
+        throw error;
+      }
+      const delay = Math.min(CONFIG.RETRY.INITIAL_DELAY * Math.pow(2, attempt - 1), CONFIG.RETRY.MAX_DELAY);
+      log(`${operation} attempt ${attempt}/${maxAttempts} failed, retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
 
 async function fetchWithTimeout(resource, options={}, ms=3000){
   const c = new AbortController(); const id = setTimeout(()=>c.abort(), ms);
@@ -104,14 +132,84 @@ async function resolveIPs(hostname){
   return [...ips].slice(0, CONFIG.LIMITS.MAX_IPS);
 }
 
-// enrichers
-async function fetchJSON(url,opts={}){ try{ const r=await fetchWithTimeout(url,{...opts},3500); if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }catch(e){ const r=await fetchWithTimeout(url,{...opts},4000); if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); } }
-async function shodanInternetDB(ip){ try{ return await fetchJSON(`https://internetdb.shodan.io/${ip}`);}catch{return{}} }
-async function ipWhoIs(ip){ try{ return await fetchJSON(`https://ipwho.is/${ip}`);}catch{} try{ return await fetchJSON(`https://ipapi.co/${ip}/json/`);}catch{} return {}; }
-async function rdapDomain(domain){ try{ return await fetchJSON(`https://rdap.org/domain/${domain}`);}catch{return null} }
-async function rdapIP(ip){ try{ return await fetchJSON(`https://rdap.org/ip/${ip}`);}catch{return null} }
-async function getSecurityTxt(origin){ try{ const u1=new URL("/.well-known/security.txt",origin).href; const r1=await fetchWithTimeout(u1,{},2000); if(r1.ok) return {url:u1}; }catch{} try{ const u2=new URL("/security.txt",origin).href; const r2=await fetchWithTimeout(u2,{},2000); if(r2.ok) return {url:u2}; }catch{} return null; }
-async function getRobots(origin){ try{ const u=new URL("/robots.txt",origin).href; const r=await fetchWithTimeout(u,{},2000); if(r.ok) return {url:u}; }catch{} return null; }
+// Enrichers with robust error handling and retry logic
+async function fetchJSON(url, opts = {}, timeout = CONFIG.TIMEOUTS.FETCH_JSON) {
+  return retryWithBackoff(async () => {
+    const r = await fetchWithTimeout(url, { ...opts }, timeout);
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    return r.json();
+  }, 2, `fetchJSON(${url})`);
+}
+
+async function shodanInternetDB(ip) {
+  try {
+    return await fetchJSON(`https://internetdb.shodan.io/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    logError(`Shodan InternetDB failed for ${ip}:`, e);
+    return {};
+  }
+}
+
+async function ipWhoIs(ip) {
+  try {
+    return await fetchJSON(`https://ipwho.is/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    log(`ipwho.is failed for ${ip}, trying ipapi.co...`);
+    try {
+      return await fetchJSON(`https://ipapi.co/${ip}/json/`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+    } catch (e2) {
+      logError(`Both IP whois services failed for ${ip}`);
+      return {};
+    }
+  }
+}
+
+async function rdapDomain(domain) {
+  try {
+    return await fetchJSON(`https://rdap.org/domain/${domain}`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
+  } catch (e) {
+    logError(`RDAP domain lookup failed for ${domain}:`, e);
+    return null;
+  }
+}
+
+async function rdapIP(ip) {
+  try {
+    return await fetchJSON(`https://rdap.org/ip/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    logError(`RDAP IP lookup failed for ${ip}:`, e);
+    return null;
+  }
+}
+
+async function getSecurityTxt(origin) {
+  try {
+    const u1 = new URL("/.well-known/security.txt", origin).href;
+    const r1 = await fetchWithTimeout(u1, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r1.ok) return { url: u1 };
+  } catch (e) {
+    log(`security.txt not found at /.well-known/, trying root...`);
+  }
+  try {
+    const u2 = new URL("/security.txt", origin).href;
+    const r2 = await fetchWithTimeout(u2, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r2.ok) return { url: u2 };
+  } catch (e) {
+    log(`security.txt not found at root either`);
+  }
+  return null;
+}
+
+async function getRobots(origin) {
+  try {
+    const u = new URL("/robots.txt", origin).href;
+    const r = await fetchWithTimeout(u, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r.ok) return { url: u };
+  } catch (e) {
+    log(`robots.txt not found for ${origin}`);
+  }
+  return null;
+}
 async function checkDMARC(d){ try{ const recs=await dohTXT(`_dmarc.${d}`); const m=recs.find(r=>String(r).toUpperCase().includes("V=DMARC1")); return {present:!!m, record:m||null}; }catch{ return {present:false, record:null}; } }
 async function checkSPF(d){ try{ const recs=await dohTXT(d); const m=recs.find(r=>String(r).toLowerCase().startsWith("v=spf1")); return {present:!!m, record:m||null}; }catch{ return {present:false, record:null}; } }
 const COMMON_DKIM=["default","google","mail","mandrill","dkim","selector","selector1","selector2","s1","s2","k1","mx","smtp"];
@@ -120,11 +218,74 @@ async function checkDKIM(d){ const found=[]; for(const sel of COMMON_DKIM){ try{
 // Subdomain enumeration - Combines passive sources (crt.sh, BufferOver, Anubis)
 // Then performs active DNS resolution to verify live subdomains
 async function subdomainsPassive(domain){
-  const set = new Set(); const q=domain.replace(/^\*\./,"");
-  try{ const r=await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`,{},2500); if(r.ok){ const t=await r.text(); let arr=[]; try{arr=JSON.parse(t);}catch{arr=t.trim().split("\n").map(x=>{try{return JSON.parse(x)}catch{return null}}).filter(Boolean);} for(const row of arr){ for(const n of String(row.name_value||"").split(/\n+/)) if(n && n.endsWith(q)) set.add(n.replace(/^\*\./,"")); } } }catch{}
-  try{ const r=await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`,{},2500); if(r.ok){ const j=await r.json(); for(const line of (j.FDNS_A||[])){ const d=(line.split(",")[1]||"").trim(); if(d.endsWith(q)) set.add(d);} for(const line of (j.FDNS_AAAA||[])){ const d=(line.split(",")[1]||"").trim(); if(d.endsWith(q)) set.add(d);} } }catch{}
-  try{ const r=await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`,{},2500); if(r.ok){ const arr=await r.json(); for(const d of arr) if(typeof d==="string"&&d.endsWith(q)) set.add(d); } }catch{}
-  return [...set].slice(0,200);
+  const set = new Set(); const q = domain.replace(/^\*\./, "");
+
+  // crt.sh - certificate transparency logs
+  try {
+    log(`Fetching subdomains from crt.sh for ${q}...`);
+    const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const t = await r.text();
+      let arr = [];
+      try {
+        arr = JSON.parse(t);
+      } catch {
+        // Handle NDJSON format
+        arr = t.trim().split("\n").map(x => {
+          try { return JSON.parse(x); } catch { return null; }
+        }).filter(Boolean);
+      }
+      for (const row of arr) {
+        const names = String(row.name_value || "").split(/\n+/);
+        for (const n of names) {
+          if (n && n.endsWith(q)) set.add(n.replace(/^\*\./, ""));
+        }
+      }
+      log(`crt.sh found ${set.size} subdomains`);
+    }
+  } catch (e) {
+    logError(`crt.sh lookup failed for ${q}:`, e);
+  }
+
+  // BufferOver - DNS aggregator
+  try {
+    log(`Fetching subdomains from BufferOver for ${q}...`);
+    const r = await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const j = await r.json();
+      const initialSize = set.size;
+      for (const line of (j.FDNS_A || [])) {
+        const d = (line.split(",")[1] || "").trim();
+        if (d && d.endsWith(q)) set.add(d);
+      }
+      for (const line of (j.FDNS_AAAA || [])) {
+        const d = (line.split(",")[1] || "").trim();
+        if (d && d.endsWith(q)) set.add(d);
+      }
+      log(`BufferOver added ${set.size - initialSize} new subdomains`);
+    }
+  } catch (e) {
+    logError(`BufferOver lookup failed for ${q}:`, e);
+  }
+
+  // Anubis - subdomain aggregator
+  try {
+    log(`Fetching subdomains from Anubis for ${q}...`);
+    const r = await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const arr = await r.json();
+      const initialSize = set.size;
+      for (const d of arr) {
+        if (typeof d === "string" && d.endsWith(q)) set.add(d);
+      }
+      log(`Anubis added ${set.size - initialSize} new subdomains`);
+    }
+  } catch (e) {
+    logError(`Anubis lookup failed for ${q}:`, e);
+  }
+
+  log(`Total ${set.size} unique subdomains found for ${q}`);
+  return [...set].slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
 }
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
@@ -212,11 +373,88 @@ async function vtDomain(domain, apiKey){
 
 // CVE enrichment - Converts CPEs (Common Platform Enumeration) from Shodan to CVE IDs with severity scores
 // Uses CIRCL.lu API (primary) with NVD (fallback) for CVE lookups
-const cveCache=new Map();
-function normCVE(items){ const out=[]; for(const it of items||[]){ if(!it) continue; let id = it.id || it.cve?.id || it.cve?.CVE_data_meta?.ID || it.cveId || it.cve?.cveId; if(!id) continue; let score=null, severity=null, published=null, lastModified=null; if("cvss" in it) score=Number(it.cvss)||null; if(typeof it.severity==="string") severity=it.severity; if("Published" in it) published=it.Published; if("Modified" in it) lastModified=it.Modified; const nvd = it.cve || it; try{ const m=nvd.metrics||{}; const v31=m.cvssMetricV31?.[0]?.cvssData; const v30=m.cvssMetricV30?.[0]?.cvssData; const v2=m.cvssMetricV2?.[0]?.cvssData; const pick=v31||v30||v2; if(pick && pick.baseScore!=null){ score=Number(pick.baseScore); severity=pick.baseSeverity||severity; } published=nvd.published||nvd.publishedDate||published; lastModified=nvd.lastModified||nvd.lastModifiedDate||lastModified; }catch{} out.push({id,score,severity,published,lastModified}); } return out; }
-async function cveFromCIRCL(cpe){ try{ const j=await fetchJSON(`https://cve.circl.lu/api/search/cpe/${encodeURIComponent(cpe)}`); return normCVE(j).map(x=>({...x,source:"circl"})); }catch{ return []; } }
-async function cveFromNVD(cpe){ try{ const j=await jsonWithTimeout(`https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(cpe)}&resultsPerPage=50`,{},4000); const arr=(j.vulnerabilities||[]).map(v=>v.cve); return normCVE(arr).map(x=>({...x,source:"nvd"})); }catch{ return []; } }
-async function enrichCVEsForCPE(cpe){ if(cveCache.has(cpe)) return cveCache.get(cpe); let items=await cveFromCIRCL(cpe); if(!items.length) items=await cveFromNVD(cpe); items.sort((a,b)=>(Number(b.score||0)-Number(a.score||0))); const top=items.slice(0,30); cveCache.set(cpe,top); return top; }
+const cveCache = new Map();
+
+function normCVE(items) {
+  const out = [];
+  for (const it of items || []) {
+    if (!it) continue;
+    let id = it.id || it.cve?.id || it.cve?.CVE_data_meta?.ID || it.cveId || it.cve?.cveId;
+    if (!id) continue;
+
+    let score = null, severity = null, published = null, lastModified = null;
+    if ("cvss" in it) score = Number(it.cvss) || null;
+    if (typeof it.severity === "string") severity = it.severity;
+    if ("Published" in it) published = it.Published;
+    if ("Modified" in it) lastModified = it.Modified;
+
+    const nvd = it.cve || it;
+    try {
+      const m = nvd.metrics || {};
+      const v31 = m.cvssMetricV31?.[0]?.cvssData;
+      const v30 = m.cvssMetricV30?.[0]?.cvssData;
+      const v2 = m.cvssMetricV2?.[0]?.cvssData;
+      const pick = v31 || v30 || v2;
+      if (pick && pick.baseScore != null) {
+        score = Number(pick.baseScore);
+        severity = pick.baseSeverity || severity;
+      }
+      published = nvd.published || nvd.publishedDate || published;
+      lastModified = nvd.lastModified || nvd.lastModifiedDate || lastModified;
+    } catch (e) {
+      logError(`Error parsing CVE metrics for ${id}:`, e);
+    }
+    out.push({ id, score, severity, published, lastModified });
+  }
+  return out;
+}
+
+async function cveFromCIRCL(cpe) {
+  try {
+    log(`Fetching CVEs from CIRCL for CPE: ${cpe}`);
+    const j = await fetchJSON(`https://cve.circl.lu/api/search/cpe/${encodeURIComponent(cpe)}`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
+    const cves = normCVE(j).map(x => ({ ...x, source: "circl" }));
+    log(`CIRCL returned ${cves.length} CVEs for ${cpe}`);
+    return cves;
+  } catch (e) {
+    logError(`CIRCL CVE lookup failed for ${cpe}:`, e);
+    return [];
+  }
+}
+
+async function cveFromNVD(cpe) {
+  try {
+    log(`Fetching CVEs from NVD for CPE: ${cpe}`);
+    const j = await fetchJSON(`https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(cpe)}&resultsPerPage=50`, {}, CONFIG.TIMEOUTS.CVE_NVD);
+    const arr = (j.vulnerabilities || []).map(v => v.cve);
+    const cves = normCVE(arr).map(x => ({ ...x, source: "nvd" }));
+    log(`NVD returned ${cves.length} CVEs for ${cpe}`);
+    return cves;
+  } catch (e) {
+    logError(`NVD CVE lookup failed for ${cpe}:`, e);
+    return [];
+  }
+}
+
+async function enrichCVEsForCPE(cpe) {
+  if (!cpe) return [];
+  if (cveCache.has(cpe)) {
+    log(`Using cached CVEs for ${cpe}`);
+    return cveCache.get(cpe);
+  }
+
+  let items = await cveFromCIRCL(cpe);
+  if (!items.length) {
+    log(`CIRCL had no results, falling back to NVD for ${cpe}`);
+    items = await cveFromNVD(cpe);
+  }
+
+  items.sort((a, b) => (Number(b.score || 0) - Number(a.score || 0)));
+  const top = items.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS / 2);
+  cveCache.set(cpe, top);
+  log(`Cached ${top.length} CVEs for ${cpe}`);
+  return top;
+}
 
 // state
 const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${tabId}`]: data });
@@ -306,29 +544,105 @@ async function analyze(tabId, url){
 
     await setTabData(tabId, { url, domain, headers: hdrSnap?hdrSnap.headers:{}, ts: Date.now() });
 
-    // IPs
+    // IPs - Resolve and enrich with all available data
     (async () => {
-      const ips = await resolveIPs(domain);
-      const perIp = {};
-      await Promise.all(ips.map(async (ip) => {
-        const [internetdb, ipwhois, iprdap, ptr] = await Promise.allSettled([ shodanInternetDB(ip), ipWhoIs(ip), rdapIP(ip), reverseDNS(ip) ]);
-        perIp[ip] = { internetdb: internetdb.value||{}, ipwhois: ipwhois.value||{}, rdap: iprdap.value||null, rdns: ptr.value||null, cve_enrich: null };
-      }));
-      await patchState(tabId, { ips, perIp });
-
-      // CVE enrichment
-      (async () => {
-        const current = await getTabData(tabId); if(!current?.perIp) return;
-        for (const ip of Object.keys(current.perIp)) {
-          try {
-            const s = current.perIp[ip]?.internetdb || {}; const cpes = Array.isArray(s.cpes) ? s.cpes.slice(0,5) : [];
-            let agg = [];
-            for (const c of cpes){ const list = await enrichCVEsForCPE(c); agg = agg.concat(list); if (agg.length>=60) break; }
-            const seen=new Set(); const dedup=[]; for(const it of agg){ if(!seen.has(it.id)){ seen.add(it.id); dedup.push(it);} }
-            const upd = await getTabData(tabId); if(!upd?.perIp?.[ip]) continue; upd.perIp[ip].cve_enrich = dedup.slice(0,60); await setTabData(tabId, upd);
-          } catch {}
+      try {
+        log(`Starting IP resolution for ${domain}...`);
+        const ips = await resolveIPs(domain);
+        if (!ips || ips.length === 0) {
+          log(`No IPs resolved for ${domain}`);
+          await patchState(tabId, { ips: [], perIp: {} });
+          return;
         }
-      })();
+        log(`Resolved ${ips.length} IPs for ${domain}: ${ips.join(', ')}`);
+
+        const perIp = {};
+        await Promise.all(ips.map(async (ip) => {
+          try {
+            log(`Enriching IP: ${ip}...`);
+            const [internetdb, ipwhois, iprdap, ptr] = await Promise.allSettled([
+              shodanInternetDB(ip),
+              ipWhoIs(ip),
+              rdapIP(ip),
+              reverseDNS(ip)
+            ]);
+
+            perIp[ip] = {
+              internetdb: internetdb.status === 'fulfilled' ? (internetdb.value || {}) : {},
+              ipwhois: ipwhois.status === 'fulfilled' ? (ipwhois.value || {}) : {},
+              rdap: iprdap.status === 'fulfilled' ? iprdap.value : null,
+              rdns: ptr.status === 'fulfilled' ? ptr.value : null,
+              cve_enrich: null
+            };
+            log(`IP ${ip} enrichment complete`);
+          } catch (e) {
+            logError(`Failed to enrich IP ${ip}:`, e);
+            perIp[ip] = { internetdb: {}, ipwhois: {}, rdap: null, rdns: null, cve_enrich: null };
+          }
+        }));
+
+        await patchState(tabId, { ips, perIp });
+        log(`IP enrichment complete for ${domain}`);
+
+        // CVE enrichment - Background task for CPE → CVE lookup
+        (async () => {
+          try {
+            log(`Starting CVE enrichment for ${domain}...`);
+            const current = await getTabData(tabId);
+            if (!current?.perIp) {
+              log(`No perIp data found, skipping CVE enrichment`);
+              return;
+            }
+
+            for (const ip of Object.keys(current.perIp)) {
+              try {
+                const ipData = current.perIp[ip];
+                if (!ipData?.internetdb) continue;
+
+                const s = ipData.internetdb || {};
+                const cpes = Array.isArray(s.cpes) ? s.cpes.slice(0, CONFIG.LIMITS.MAX_CPES_PER_IP) : [];
+
+                if (cpes.length === 0) {
+                  log(`No CPEs found for IP ${ip}`);
+                  continue;
+                }
+
+                log(`Found ${cpes.length} CPEs for IP ${ip}, enriching...`);
+                let agg = [];
+                for (const c of cpes) {
+                  const list = await enrichCVEsForCPE(c);
+                  agg = agg.concat(list);
+                  if (agg.length >= CONFIG.LIMITS.MAX_CVE_RESULTS) break;
+                }
+
+                // Deduplicate CVEs
+                const seen = new Set();
+                const dedup = [];
+                for (const it of agg) {
+                  if (it && it.id && !seen.has(it.id)) {
+                    seen.add(it.id);
+                    dedup.push(it);
+                  }
+                }
+
+                const upd = await getTabData(tabId);
+                if (!upd?.perIp?.[ip]) continue;
+                upd.perIp[ip].cve_enrich = dedup.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS);
+                await setTabData(tabId, upd);
+                log(`CVE enrichment complete for IP ${ip}: ${dedup.length} CVEs`);
+              } catch (e) {
+                logError(`CVE enrichment failed for IP ${ip}:`, e);
+              }
+            }
+            log(`CVE enrichment complete for all IPs`);
+          } catch (e) {
+            logError(`CVE enrichment process failed:`, e);
+          }
+        })();
+      } catch (e) {
+        logError(`IP resolution/enrichment failed for ${domain}:`, e);
+        await patchState(tabId, { ips: [], perIp: {}, error: `IP resolution failed: ${e.message}` });
+      }
     })();
 
     // Domain posture
