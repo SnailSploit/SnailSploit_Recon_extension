@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SnailSploit Recon Extension",
-  "version": "1.0.0",
-  "description": "SnailSploit Recon: Production-ready recon with 50+ secret patterns, 60+ tech fingerprints, robust APIs, export features. Built for red teamers.",
+  "version": "1.1.0",
+  "description": "SnailSploit Recon: AI-powered recon with OpenAI integration! Smart host filtering, correlation analysis, 50+ secrets, 60+ tech fingerprints.",
   "permissions": [
     "storage",
     "tabs",
@@ -11,6 +11,7 @@
   ],
   "host_permissions": [
     "*://*/*",
+    "https://api.openai.com/*",
     "https://internetdb.shodan.io/*",
     "https://dns.google/resolve*",
     "https://cloudflare-dns.com/*",

@@ -408,6 +408,193 @@ async function vtDomain(domain, apiKey){
   if(!r.ok) throw new Error(`VirusTotal HTTP ${r.status}`); const j=await r.json(); const a=j?.data?.attributes||{}; return { reputation:a.reputation??0, last_analysis_stats:a.last_analysis_stats||null, categories:a.categories||null };
 }
 
+// OpenAI API integration for intelligent host filtering and correlation
+async function callOpenAI(apiKey, messages, model = "gpt-4o-mini") {
+  try {
+    const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: messages,
+        temperature: 0.3,
+        max_tokens: 2000
+      })
+    }, 15000);
+
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`OpenAI API error ${r.status}: ${err}`);
+    }
+
+    const j = await r.json();
+    return j.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    logError(`OpenAI API call failed:`, e);
+    return null;
+  }
+}
+
+// AI-powered host filtering - uses OpenAI to identify relevant hosts
+async function filterHostsWithAI(apiKey, hosts, targetDomain) {
+  if (!apiKey || !hosts || hosts.length === 0) return hosts;
+
+  try {
+    log(`Using AI to filter ${hosts.length} hosts for ${targetDomain}...`);
+
+    const prompt = `You are a cybersecurity reconnaissance expert. Given the target domain "${targetDomain}", analyze this list of subdomains and identify which ones are RELEVANT for security reconnaissance.
+
+Subdomains found (${hosts.length} total):
+${hosts.slice(0, 200).join('\n')}
+
+Filter OUT:
+- CDN/caching subdomains (cdn, cache, static, assets)
+- Wildcard/test subdomains (test, dev, staging - UNLESS they look production-exposed)
+- Third-party/unrelated services
+- Obvious spam/parked domains
+
+Keep RELEVANT subdomains for:
+- Production services (api, admin, portal, app, www)
+- Authentication/IAM (auth, login, sso, oauth)
+- Internal/staging if production-exposed (vpn, internal, intranet)
+- Interesting infrastructure (mail, mx, smtp, git, jenkins, grafana)
+- Database/backend services (db, sql, mongo, redis)
+
+Respond with ONLY a JSON array of relevant hostnames, no explanation:
+["host1.example.com", "host2.example.com"]
+
+If all should be kept, return all. If none are relevant, return [].`;
+
+    const response = await callOpenAI(apiKey, [
+      { role: "system", content: "You are a cybersecurity expert assistant specializing in reconnaissance and infrastructure analysis. Respond only with valid JSON." },
+      { role: "user", content: prompt }
+    ]);
+
+    if (!response) {
+      log(`AI filtering failed, returning all hosts`);
+      return hosts;
+    }
+
+    // Parse AI response
+    const filtered = JSON.parse(response.trim());
+    if (Array.isArray(filtered)) {
+      log(`AI filtered ${hosts.length} hosts down to ${filtered.length} relevant ones`);
+      return filtered;
+    } else {
+      logError(`AI response was not an array, returning all hosts`);
+      return hosts;
+    }
+  } catch (e) {
+    logError(`AI host filtering failed:`, e);
+    return hosts; // Fallback to all hosts
+  }
+}
+
+// AI-powered correlation - finds connections between different data sources
+async function correlateFindings(apiKey, state) {
+  if (!apiKey || !state) return null;
+
+  try {
+    log(`Using AI to correlate findings for ${state.domain}...`);
+
+    const summary = {
+      domain: state.domain,
+      ips: state.ips || [],
+      subdomains: (state.quickSubs || []).map(s => s.subdomain).slice(0, 50),
+      technologies: (state.tech?.tags || []),
+      secretsCount: (state.secrets || []).length,
+      cveCount: Object.values(state.perIp || {}).reduce((acc, ip) => acc + (ip.cve_enrich?.length || 0), 0),
+      headers: Object.keys(state.headers || {}),
+      hasSecurityTxt: !!state.securityTxt,
+      hasRobots: !!state.robots,
+      dmarcPresent: state.dmarc?.present || false,
+      spfPresent: state.spf?.present || false
+    };
+
+    const prompt = `You are a cybersecurity reconnaissance expert. Analyze these findings for ${state.domain} and provide key insights and correlations:
+
+FINDINGS:
+${JSON.stringify(summary, null, 2)}
+
+Provide a concise analysis covering:
+1. **Security Posture**: Overall security assessment (headers, email security, exposed services)
+2. **Attack Surface**: Interesting entry points, exposed services, potential vulnerabilities
+3. **Infrastructure**: Hosting/CDN, technology stack insights, interesting patterns
+4. **Recommendations**: Top 2-3 areas to investigate further
+
+Respond in markdown format, be concise (max 300 words), focus on actionable intel for red team operators.`;
+
+    const response = await callOpenAI(apiKey, [
+      { role: "system", content: "You are a cybersecurity expert providing reconnaissance analysis for authorized penetration testing." },
+      { role: "user", content: prompt }
+    ]);
+
+    if (response) {
+      log(`AI correlation generated ${response.length} chars of analysis`);
+      return response;
+    }
+
+    return null;
+  } catch (e) {
+    logError(`AI correlation failed:`, e);
+    return null;
+  }
+}
+
+// Enhanced crt.sh background processing with AI filtering
+async function enhancedSubdomainRecon(domain, openaiApiKey) {
+  try {
+    log(`Starting enhanced subdomain recon for ${domain} with AI filtering...`);
+
+    // Get all subdomains from crt.sh (more extensive than normal)
+    const allSubs = await subdomainsPassive(domain);
+    log(`Found ${allSubs.length} total subdomains from passive sources`);
+
+    if (allSubs.length === 0) return [];
+
+    // Use AI to filter relevant hosts
+    const relevantHosts = await filterHostsWithAI(openaiApiKey, allSubs, domain);
+    log(`AI filtered to ${relevantHosts.length} relevant hosts`);
+
+    // Resolve filtered hosts to IPs
+    const resolvedHosts = [];
+    const queue = relevantHosts.slice(0, 100); // Limit to top 100 AI-filtered
+    const limit = CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
+
+    async function worker() {
+      while (queue.length) {
+        const host = queue.shift();
+        try {
+          const a4 = (await dohResolve(host, "A")).filter(x => x.type === 1).map(x => x.data);
+          const a6 = (await dohResolve(host, "AAAA")).filter(x => x.type === 28).map(x => x.data);
+
+          if (a4.length || a6.length) {
+            resolvedHosts.push({
+              subdomain: host,
+              a: a4,
+              aaaa: a6,
+              aiFiltered: true
+            });
+          }
+        } catch (e) {
+          logError(`Failed to resolve ${host}:`, e);
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: limit }, worker));
+    log(`Resolved ${resolvedHosts.length} AI-filtered hosts to IPs`);
+
+    return resolvedHosts;
+  } catch (e) {
+    logError(`Enhanced subdomain recon failed:`, e);
+    return [];
+  }
+}
+
 // CVE enrichment - Converts CPEs (Common Platform Enumeration) from Shodan to CVE IDs with severity scores
 // Uses CIRCL.lu API (primary) with NVD (fallback) for CVE lookups
 const cveCache = new Map();
@@ -760,6 +947,31 @@ async function analyze(tabId, url){
       await patchState(tabId, { quickSubs: liveSubs });
     })();
 
+    // AI-Enhanced Subdomain Recon (background task)
+    (async () => {
+      try {
+        const { openaiApiKey: saved } = await chrome.storage.local.get(["openaiApiKey"]);
+        let apiKey = saved;
+        if (!apiKey) {
+          try {
+            const cfg = await (await fetch(chrome.runtime.getURL("config.json"))).json();
+            apiKey = cfg.openaiApiKey || "";
+          } catch {}
+        }
+
+        if (apiKey) {
+          log(`OpenAI API key found, starting AI-enhanced subdomain recon...`);
+          const enhancedSubs = await enhancedSubdomainRecon(domain, apiKey);
+          await patchState(tabId, { aiEnhancedSubs: enhancedSubs });
+          log(`AI-enhanced subdomain recon complete: ${enhancedSubs.length} relevant hosts`);
+        } else {
+          log(`No OpenAI API key configured, skipping AI-enhanced recon`);
+        }
+      } catch (e) {
+        logError(`AI-enhanced subdomain recon failed:`, e);
+      }
+    })();
+
     // Secrets if resources already here
     const res = resourcesByTab.get(tabId);
     if (res) {
@@ -770,6 +982,37 @@ async function analyze(tabId, url){
       const tech = detectTech({ headers: (await getTabData(tabId))?.headers || {}, meta: res.meta||{}, domHints: res.domHints||{}, faviconHash: fav });
       await patchState(tabId, { tech });
     }
+
+    // AI Correlation (background task - runs after all data collected)
+    (async () => {
+      try {
+        // Wait a bit for other recon to complete
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        const { openaiApiKey: saved } = await chrome.storage.local.get(["openaiApiKey"]);
+        let apiKey = saved;
+        if (!apiKey) {
+          try {
+            const cfg = await (await fetch(chrome.runtime.getURL("config.json"))).json();
+            apiKey = cfg.openaiApiKey || "";
+          } catch {}
+        }
+
+        if (apiKey) {
+          const currentState = await getTabData(tabId);
+          if (currentState) {
+            log(`Starting AI correlation for ${domain}...`);
+            const correlation = await correlateFindings(apiKey, currentState);
+            if (correlation) {
+              await patchState(tabId, { aiCorrelation: correlation });
+              log(`AI correlation complete for ${domain}`);
+            }
+          }
+        }
+      } catch (e) {
+        logError(`AI correlation failed:`, e);
+      }
+    })();
 
   }catch(e){ await setTabData(tabId, { url, error: String(e) }); }
 }
