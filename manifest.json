@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SnailSploit Recon Extension",
-  "version": "0.9.0",
-  "description": "SnailSploit Recon: instant site recon with layered fallbacks (headers, IP/CVEs, subdomains, secrets, tech). Enhanced security & export features.",
+  "version": "1.0.0",
+  "description": "SnailSploit Recon: Production-ready recon with 50+ secret patterns, 60+ tech fingerprints, robust APIs, export features. Built for red teamers.",
   "permissions": [
     "storage",
     "tabs",

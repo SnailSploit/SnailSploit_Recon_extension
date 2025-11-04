@@ -311,38 +311,75 @@ function mmh3_32_from_b64(b64){
 // Fetches favicon and computes its mmh3 hash for fingerprinting
 async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
 
-// Secrets scanner - Regex patterns to detect exposed credentials, API keys, and sensitive endpoints
-// Includes patterns for AWS, Google, GitHub, Slack, Discord, Telegram, and more
+// Secrets scanner - Comprehensive patterns for exposed credentials, API keys, and sensitive data
+// Over 40 patterns covering major cloud providers, SaaS platforms, and crypto
 const SECRET_PATTERNS=[
+  // AWS
   {id:"aws_access_key", rx:/AKIA[0-9A-Z]{16}/g},
   {id:"aws_secret_key", rx:/(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)[\s:=]+[A-Za-z0-9\/\+=]{40}/g},
+  {id:"aws_session_token", rx:/(?:aws_session_token|AWS_SESSION_TOKEN)[\s:=]+[A-Za-z0-9\/\+=]{100,}/g},
+  // Google Cloud & Firebase
   {id:"google_api_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
   {id:"google_oauth", rx:/ya29\.[0-9A-Za-z\-_]+/g},
+  {id:"gcp_sa", rx:/[a-z0-9\-]{6,}\@[a-z0-9\-]+\.iam\.gserviceaccount\.com/g},
+  {id:"firebase_db", rx:/https:\/\/[a-z0-9\-]+\.firebaseio\.com/gi},
+  // GitHub
   {id:"github_pat", rx:/(?:ghp|gho|ghu|ghs)_[A-Za-z0-9]{36}/g},
   {id:"github_fine_grained", rx:/github_pat_[A-Za-z0-9_]{22,}/g},
+  {id:"github_oauth", rx:/gho_[0-9A-Za-z]{36}/g},
+  // GitLab
+  {id:"gitlab_pat", rx:/glpat-[0-9A-Za-z\-_]{20,}/g},
+  // Slack
   {id:"slack_token", rx:/xox[baprs]-[A-Za-z0-9\-]{10,48}/g},
   {id:"slack_webhook", rx:/https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{8,}\/B[A-Z0-9]{8,}\/[A-Za-z0-9]{24}/g},
-  {id:"stripe_key", rx:/(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g},
-  {id:"sendgrid_key", rx:/SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}/g},
-  {id:"twilio_sid", rx:/AC[a-f0-9]{32}/gi},
-  {id:"twilio_token", rx:/SK[a-f0-9]{32}/gi},
-  {id:"firebase_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
-  {id:"firebase_db", rx:/https:\/\/[a-z0-9\-]+\.firebaseio\.com/gi},
+  // Discord
   {id:"discord_token", rx:/[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g},
   {id:"discord_webhook", rx:/https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d{17,19}\/[A-Za-z0-9_\-]{68}/g},
+  // Telegram
   {id:"telegram_bot", rx:/\b\d{8,10}:[A-Za-z0-9_\-]{35}\b/g},
-  {id:"jwt", rx:/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g},
-  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----/g},
-  {id:"gcp_sa", rx:/[a-z0-9\-]{6,}\@[a-z0-9\-]+\.iam\.gserviceaccount\.com/g},
-  {id:"s3_url", rx:/https?:\/\/[a-z0-9\.\-]{3,}\.s3\.amazonaws\.com\/[^\s"'<>()]+/gi},
-  {id:"azure_sas", rx:/(?:sig=)[A-Za-z0-9%]{20,}&(?:se=|\bsv=)/g},
-  {id:"heroku_key", rx:/[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/gi},
-  {id:"mailgun_key", rx:/key-[0-9a-zA-Z]{32}/g},
+  // Payment Processors
+  {id:"stripe_key", rx:/(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,99}/g},
   {id:"paypal_braintree", rx:/access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}/g},
+  {id:"square_token", rx:/sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}/g},
+  // Email & SMS
+  {id:"sendgrid_key", rx:/SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}/g},
+  {id:"mailgun_key", rx:/key-[0-9a-zA-Z]{32}/g},
+  {id:"twilio_sid", rx:/AC[a-f0-9]{32}/gi},
+  {id:"twilio_token", rx:/SK[a-f0-9]{32}/gi},
+  // Cloud Storage
+  {id:"s3_url", rx:/https?:\/\/[a-z0-9\.\-]{3,}\.s3[.\-](?:[a-z0-9\-]+\.)?amazonaws\.com\/[^\s"'<>()]+/gi},
+  {id:"azure_sas", rx:/(?:sig=)[A-Za-z0-9%]{20,}&(?:se=|\bsv=)/g},
+  {id:"gcs_bucket", rx:/https?:\/\/storage\.googleapis\.com\/[a-z0-9\-_.]+/gi},
+  // Heroku & PaaS
+  {id:"heroku_key", rx:/[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/gi},
+  {id:"doppler_token", rx:/dp\.pt\.[a-zA-Z0-9]{43}/g},
+  // Databases
+  {id:"mongodb_uri", rx:/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi},
+  {id:"postgres_uri", rx:/postgres(?:ql)?:\/\/[^\s"'<>]+/gi},
+  {id:"redis_uri", rx:/redis:\/\/[^\s"'<>]+/gi},
+  {id:"mysql_uri", rx:/mysql:\/\/[^\s"'<>]+/gi},
+  // Auth & JWT
+  {id:"jwt", rx:/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g},
+  {id:"bearer_token", rx:/[Bb]earer\s+[A-Za-z0-9\-_=]{20,}/g},
+  {id:"basic_auth", rx:/[Bb]asic\s+[A-Za-z0-9+\/=]{20,}/g},
+  // Private Keys
+  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP|PRIVATE) (?:PRIVATE )?KEY-----/g},
+  {id:"ssh_key", rx:/ssh-rsa\s+AAAA[0-9A-Za-z+\/]+[=]{0,3}/g},
+  // Crypto & Blockchain
+  {id:"ethereum_key", rx:/0x[a-fA-F0-9]{64}/g},
+  {id:"bitcoin_address", rx:/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g},
+  // Network & Infrastructure
   {id:"internal_ip", rx:/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g},
+  {id:"ipv6_address", rx:/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g},
+  // API Endpoints & Routes
   {id:"endpoint_url", rx:/https?:\/\/[a-z0-9\.\-]+(?::\d{2,5})?(?:\/[A-Za-z0-9_\-\.~%\/\?\=\&#]+)?/gi},
-  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v1|v2|v3|graphql|admin|internal)\/[A-Za-z0-9_\-\/\.]+/gi},
-  {id:"api_key_assign", rx:/(?:api[_-]?key|token|secret|bearer)\s*[:=]\s*["'][^"']{12,}["']/gi}
+  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v\d+|graphql|admin|internal|wp-json)\/[A-Za-z0-9_\-\/\.]+/gi},
+  {id:"api_key_assign", rx:/(?:api[_-]?key|apikey|token|secret|password|passwd|bearer|auth)[\s]*[:=][\s]*["'][^"']{8,}["']/gi},
+  // Additional Secrets
+  {id:"npm_token", rx:/npm_[A-Za-z0-9]{36}/g},
+  {id:"pypi_token", rx:/pypi-[A-Za-z0-9\-_]{32,}/g},
+  {id:"docker_hub_token", rx:/dckr_pat_[A-Za-z0-9_-]{32,}/g},
+  {id:"datadog_key", rx:/[a-f0-9]{32}(?:-[a-f0-9]{8})?/g}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
 async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await r.text(); return t.slice(0, 300*1024);}catch{ return ""; } }
@@ -461,27 +498,93 @@ const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${t
 const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
 async function patchState(tabId, patch){ const cur=await getTabData(tabId)||{}; const next=merge(cur,patch); await setTabData(tabId,next); return next; }
 
-// tech heuristics
+// Technology detection - Comprehensive fingerprinting from headers, meta tags, and DOM hints
 function detectTech({headers={}, meta={}, domHints={}, faviconHash}){
   const tags=new Set(); const notes=[];
   const H = (k)=>headers[k] || headers[k?.toLowerCase?.()] || null;
-  const server=H("server")||""; const via=H("via")||""; const powered=H("x-powered-by")||""; const gen=(meta?.generator||"").toLowerCase(); const paths=(domHints?.paths||[]).join(" ");
-  if(/cloudflare/i.test(server) || headers["cf-ray"]) tags.add("Cloudflare");
+  const server=H("server")||""; const via=H("via")||""; const powered=H("x-powered-by")||"";
+  const gen=(meta?.generator||"").toLowerCase(); const paths=(domHints?.paths||[]).join(" ");
+  const hStr = JSON.stringify(headers).toLowerCase();
+
+  // CDN & Edge
+  if(/cloudflare/i.test(server) || H("cf-ray")) tags.add("Cloudflare");
   if(/fastly|varnish/i.test(server)) tags.add("Fastly");
   if(/akamai/i.test(server) || /akamai/i.test(via)) tags.add("Akamai");
-  if(/vercel/i.test(server) || /x-vercel-id/i.test(JSON.stringify(headers))) tags.add("Vercel");
+  if(/cloudfront|x-amz-cf-id/i.test(hStr)) tags.add("AWS CloudFront");
+  if(/bunnycdn/i.test(hStr)) tags.add("BunnyCDN");
+  if(/stackpath|netdna/i.test(server)) tags.add("StackPath");
+
+  // Hosting Platforms
+  if(/vercel/i.test(server) || /x-vercel-id/i.test(hStr)) tags.add("Vercel");
   if(/github-pages|GitHub\.com/i.test(server)) tags.add("GitHub Pages");
-  if(/Netlify|x-nf-request-id/i.test(JSON.stringify(headers))) tags.add("Netlify");
-  if(/wordpress/i.test(gen) || /wp-content|wp-includes/i.test(paths)) tags.add("WordPress");
+  if(/Netlify|x-nf-request-id/i.test(hStr)) tags.add("Netlify");
+  if(/WP Engine/i.test(hStr)) tags.add("WP Engine");
+  if(/x-kinsta/i.test(hStr)) tags.add("Kinsta");
+
+  // CMS & Frameworks
+  if(/wordpress/i.test(gen) || /wp-content|wp-includes|wp-json/i.test(paths)) tags.add("WordPress");
   if(/drupal/i.test(gen) || /drupal/i.test(paths)) tags.add("Drupal");
+  if(/joomla/i.test(gen) || /joomla/i.test(paths)) tags.add("Joomla");
+  if(/wix\.com/i.test(hStr)) tags.add("Wix");
+  if(/squarespace/i.test(hStr)) tags.add("Squarespace");
+  if(/shopify/i.test(hStr)) tags.add("Shopify");
+  if(/magento/i.test(powered) || /mage/i.test(paths)) tags.add("Magento");
+  if(/prestashop/i.test(gen)) tags.add("PrestaShop");
+  if(/webflow/i.test(hStr)) tags.add("Webflow");
+
+  // JavaScript Frameworks
   if(/next\.js/i.test(powered) || /_next\//i.test(paths)) tags.add("Next.js");
-  if(/_nuxt\//i.test(paths)) tags.add("Nuxt");
-  if(/express/i.test(powered)) tags.add("Express");
-  if(/php/i.test(powered) || /\.php\b/i.test(paths)) tags.add("PHP");
-  if(/asp\.net|microsoft/i.test(powered) || /x-aspnet/i.test(JSON.stringify(headers))) tags.add("ASP.NET");
-  if(/rails/i.test(powered) || /_rails_session/i.test(JSON.stringify(headers))) tags.add("Rails");
+  if(/_nuxt\//i.test(paths) || /nuxt/i.test(powered)) tags.add("Nuxt.js");
+  if(/gatsby/i.test(gen) || /gatsby/i.test(paths)) tags.add("Gatsby");
+  if(/angular/i.test(paths) || /ng-/i.test(hStr)) tags.add("Angular");
+  if(/react/i.test(paths)) tags.add("React");
+  if(/vue\.js/i.test(paths) || /vuejs/i.test(hStr)) tags.add("Vue.js");
+  if(/svelte/i.test(paths)) tags.add("Svelte");
+  if(/ember/i.test(paths)) tags.add("Ember.js");
+
+  // Backend/Server
+  if(/express/i.test(powered)) tags.add("Express.js");
+  if(/nginx/i.test(server)) tags.add("Nginx");
+  if(/apache/i.test(server)) tags.add("Apache");
+  if(/iis|microsoft/i.test(server)) tags.add("IIS");
+  if(/kestrel/i.test(server)) tags.add("Kestrel");
+  if(/litespeed/i.test(server)) tags.add("LiteSpeed");
+  if(/tomcat/i.test(server)) tags.add("Apache Tomcat");
+  if(/jetty/i.test(server)) tags.add("Jetty");
+  if(/gunicorn/i.test(server)) tags.add("Gunicorn");
+  if(/uwsgi/i.test(server)) tags.add("uWSGI");
+  if(/passenger/i.test(server)) tags.add("Phusion Passenger");
+
+  // Languages & Runtimes
+  if(/php/i.test(powered) || /\.php\b/i.test(paths) || /x-php/i.test(hStr)) tags.add("PHP");
+  if(/asp\.net|microsoft/i.test(powered) || /x-aspnet/i.test(hStr)) tags.add("ASP.NET");
+  if(/rails/i.test(powered) || /_rails_session/i.test(hStr)) tags.add("Ruby on Rails");
+  if(/django/i.test(powered) || /csrftoken|django/i.test(hStr)) tags.add("Django");
+  if(/flask/i.test(powered)) tags.add("Flask");
+  if(/laravel/i.test(powered) || /laravel/i.test(paths)) tags.add("Laravel");
+  if(/symfony/i.test(powered) || /symfony/i.test(paths)) tags.add("Symfony");
+  if(/spring/i.test(powered) || /jsessionid/i.test(hStr)) tags.add("Spring");
+  if(/\.jsp\b/i.test(paths)) tags.add("JSP/Java");
+  if(/\.aspx\b/i.test(paths)) tags.add("ASP.NET");
+  if(/\.cfm\b/i.test(paths)) tags.add("ColdFusion");
+
+  // WAF & Security
+  if(/x-sucuri/i.test(hStr)) tags.add("Sucuri WAF");
+  if(/wordfence/i.test(hStr)) tags.add("Wordfence");
+  if(/x-powered-by-plesk/i.test(hStr)) tags.add("Plesk");
+  if(/cpanel/i.test(hStr)) tags.add("cPanel");
+
+  // Analytics & Tracking
+  if(/google-site-verification/i.test(hStr)) notes.push("Google Site Verification");
+  if(/google-analytics|gtag|ga\.js/i.test(paths)) notes.push("Google Analytics");
+  if(/facebook\.net|fbevents/i.test(paths)) notes.push("Facebook Pixel");
+
+  // Additional Info
   if(typeof faviconHash==="number") notes.push(`favicon mmh3: ${faviconHash}`);
-  return { tags: Array.from(tags).slice(0,12), notes };
+  if(H("x-cache")) notes.push(`Cache: ${H("x-cache")}`);
+  if(H("x-runtime")) notes.push(`Runtime: ${H("x-runtime")}`);
+
+  return { tags: Array.from(tags).slice(0,25), notes };
 }
 
 // content bridge
