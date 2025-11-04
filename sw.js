@@ -1,16 +1,18 @@
 
-// Configuration constants
+// Configuration constants - More generous timeouts for robustness
 const CONFIG = {
   TIMEOUTS: {
-    FETCH_DEFAULT: 3000,
-    FETCH_HEADERS: 2500,
-    FETCH_TEXT: 2500,
-    FETCH_JSON: 3500,
-    FETCH_FAVICON: 2000,
-    DOH_RESOLVE: 2500,
-    SECURITY_TXT: 2000,
-    VT_REQUEST: 3000,
-    CVE_NVD: 4000
+    FETCH_DEFAULT: 8000,      // Increased from 3000
+    FETCH_HEADERS: 5000,      // Increased from 2500
+    FETCH_TEXT: 6000,         // Increased from 2500
+    FETCH_JSON: 8000,         // Increased from 3500
+    FETCH_FAVICON: 4000,      // Increased from 2000
+    DOH_RESOLVE: 5000,        // Increased from 2500
+    SECURITY_TXT: 4000,       // Increased from 2000
+    VT_REQUEST: 8000,         // Increased from 3000
+    CVE_NVD: 10000,           // Increased from 4000
+    SUBDOMAIN_PASSIVE: 8000,  // New
+    IP_ENRICHMENT: 8000       // New
   },
   LIMITS: {
     MAX_IPS: 20,
@@ -26,11 +28,37 @@ const CONFIG = {
     MAX_SOURCE_MAPS: 6,
     MAX_DKIM_SELECTORS: 6,
     MAX_DOM_PATHS: 200
+  },
+  RETRY: {
+    MAX_ATTEMPTS: 3,
+    INITIAL_DELAY: 500,
+    MAX_DELAY: 4000
   }
 };
 
 function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
+function logError(...a){ try{ console.error("[SnailSploit Recon ERROR]", ...a);}catch{} }
 const merge = (a,b)=>Object.assign({},a||{},b||{});
+
+// Exponential backoff retry helper
+async function retryWithBackoff(fn, maxAttempts = CONFIG.RETRY.MAX_ATTEMPTS, operation = "operation") {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts) {
+        logError(`${operation} failed after ${maxAttempts} attempts:`, error);
+        throw error;
+      }
+      const delay = Math.min(CONFIG.RETRY.INITIAL_DELAY * Math.pow(2, attempt - 1), CONFIG.RETRY.MAX_DELAY);
+      log(`${operation} attempt ${attempt}/${maxAttempts} failed, retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
 
 async function fetchWithTimeout(resource, options={}, ms=3000){
   const c = new AbortController(); const id = setTimeout(()=>c.abort(), ms);
@@ -104,14 +132,84 @@ async function resolveIPs(hostname){
   return [...ips].slice(0, CONFIG.LIMITS.MAX_IPS);
 }
 
-// enrichers
-async function fetchJSON(url,opts={}){ try{ const r=await fetchWithTimeout(url,{...opts},3500); if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }catch(e){ const r=await fetchWithTimeout(url,{...opts},4000); if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); } }
-async function shodanInternetDB(ip){ try{ return await fetchJSON(`https://internetdb.shodan.io/${ip}`);}catch{return{}} }
-async function ipWhoIs(ip){ try{ return await fetchJSON(`https://ipwho.is/${ip}`);}catch{} try{ return await fetchJSON(`https://ipapi.co/${ip}/json/`);}catch{} return {}; }
-async function rdapDomain(domain){ try{ return await fetchJSON(`https://rdap.org/domain/${domain}`);}catch{return null} }
-async function rdapIP(ip){ try{ return await fetchJSON(`https://rdap.org/ip/${ip}`);}catch{return null} }
-async function getSecurityTxt(origin){ try{ const u1=new URL("/.well-known/security.txt",origin).href; const r1=await fetchWithTimeout(u1,{},2000); if(r1.ok) return {url:u1}; }catch{} try{ const u2=new URL("/security.txt",origin).href; const r2=await fetchWithTimeout(u2,{},2000); if(r2.ok) return {url:u2}; }catch{} return null; }
-async function getRobots(origin){ try{ const u=new URL("/robots.txt",origin).href; const r=await fetchWithTimeout(u,{},2000); if(r.ok) return {url:u}; }catch{} return null; }
+// Enrichers with robust error handling and retry logic
+async function fetchJSON(url, opts = {}, timeout = CONFIG.TIMEOUTS.FETCH_JSON) {
+  return retryWithBackoff(async () => {
+    const r = await fetchWithTimeout(url, { ...opts }, timeout);
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    return r.json();
+  }, 2, `fetchJSON(${url})`);
+}
+
+async function shodanInternetDB(ip) {
+  try {
+    return await fetchJSON(`https://internetdb.shodan.io/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    logError(`Shodan InternetDB failed for ${ip}:`, e);
+    return {};
+  }
+}
+
+async function ipWhoIs(ip) {
+  try {
+    return await fetchJSON(`https://ipwho.is/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    log(`ipwho.is failed for ${ip}, trying ipapi.co...`);
+    try {
+      return await fetchJSON(`https://ipapi.co/${ip}/json/`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+    } catch (e2) {
+      logError(`Both IP whois services failed for ${ip}`);
+      return {};
+    }
+  }
+}
+
+async function rdapDomain(domain) {
+  try {
+    return await fetchJSON(`https://rdap.org/domain/${domain}`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
+  } catch (e) {
+    logError(`RDAP domain lookup failed for ${domain}:`, e);
+    return null;
+  }
+}
+
+async function rdapIP(ip) {
+  try {
+    return await fetchJSON(`https://rdap.org/ip/${ip}`, {}, CONFIG.TIMEOUTS.IP_ENRICHMENT);
+  } catch (e) {
+    logError(`RDAP IP lookup failed for ${ip}:`, e);
+    return null;
+  }
+}
+
+async function getSecurityTxt(origin) {
+  try {
+    const u1 = new URL("/.well-known/security.txt", origin).href;
+    const r1 = await fetchWithTimeout(u1, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r1.ok) return { url: u1 };
+  } catch (e) {
+    log(`security.txt not found at /.well-known/, trying root...`);
+  }
+  try {
+    const u2 = new URL("/security.txt", origin).href;
+    const r2 = await fetchWithTimeout(u2, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r2.ok) return { url: u2 };
+  } catch (e) {
+    log(`security.txt not found at root either`);
+  }
+  return null;
+}
+
+async function getRobots(origin) {
+  try {
+    const u = new URL("/robots.txt", origin).href;
+    const r = await fetchWithTimeout(u, {}, CONFIG.TIMEOUTS.SECURITY_TXT);
+    if (r.ok) return { url: u };
+  } catch (e) {
+    log(`robots.txt not found for ${origin}`);
+  }
+  return null;
+}
 async function checkDMARC(d){ try{ const recs=await dohTXT(`_dmarc.${d}`); const m=recs.find(r=>String(r).toUpperCase().includes("V=DMARC1")); return {present:!!m, record:m||null}; }catch{ return {present:false, record:null}; } }
 async function checkSPF(d){ try{ const recs=await dohTXT(d); const m=recs.find(r=>String(r).toLowerCase().startsWith("v=spf1")); return {present:!!m, record:m||null}; }catch{ return {present:false, record:null}; } }
 const COMMON_DKIM=["default","google","mail","mandrill","dkim","selector","selector1","selector2","s1","s2","k1","mx","smtp"];
@@ -120,11 +218,74 @@ async function checkDKIM(d){ const found=[]; for(const sel of COMMON_DKIM){ try{
 // Subdomain enumeration - Combines passive sources (crt.sh, BufferOver, Anubis)
 // Then performs active DNS resolution to verify live subdomains
 async function subdomainsPassive(domain){
-  const set = new Set(); const q=domain.replace(/^\*\./,"");
-  try{ const r=await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`,{},2500); if(r.ok){ const t=await r.text(); let arr=[]; try{arr=JSON.parse(t);}catch{arr=t.trim().split("\n").map(x=>{try{return JSON.parse(x)}catch{return null}}).filter(Boolean);} for(const row of arr){ for(const n of String(row.name_value||"").split(/\n+/)) if(n && n.endsWith(q)) set.add(n.replace(/^\*\./,"")); } } }catch{}
-  try{ const r=await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`,{},2500); if(r.ok){ const j=await r.json(); for(const line of (j.FDNS_A||[])){ const d=(line.split(",")[1]||"").trim(); if(d.endsWith(q)) set.add(d);} for(const line of (j.FDNS_AAAA||[])){ const d=(line.split(",")[1]||"").trim(); if(d.endsWith(q)) set.add(d);} } }catch{}
-  try{ const r=await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`,{},2500); if(r.ok){ const arr=await r.json(); for(const d of arr) if(typeof d==="string"&&d.endsWith(q)) set.add(d); } }catch{}
-  return [...set].slice(0,200);
+  const set = new Set(); const q = domain.replace(/^\*\./, "");
+
+  // crt.sh - certificate transparency logs
+  try {
+    log(`Fetching subdomains from crt.sh for ${q}...`);
+    const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const t = await r.text();
+      let arr = [];
+      try {
+        arr = JSON.parse(t);
+      } catch {
+        // Handle NDJSON format
+        arr = t.trim().split("\n").map(x => {
+          try { return JSON.parse(x); } catch { return null; }
+        }).filter(Boolean);
+      }
+      for (const row of arr) {
+        const names = String(row.name_value || "").split(/\n+/);
+        for (const n of names) {
+          if (n && n.endsWith(q)) set.add(n.replace(/^\*\./, ""));
+        }
+      }
+      log(`crt.sh found ${set.size} subdomains`);
+    }
+  } catch (e) {
+    logError(`crt.sh lookup failed for ${q}:`, e);
+  }
+
+  // BufferOver - DNS aggregator
+  try {
+    log(`Fetching subdomains from BufferOver for ${q}...`);
+    const r = await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const j = await r.json();
+      const initialSize = set.size;
+      for (const line of (j.FDNS_A || [])) {
+        const d = (line.split(",")[1] || "").trim();
+        if (d && d.endsWith(q)) set.add(d);
+      }
+      for (const line of (j.FDNS_AAAA || [])) {
+        const d = (line.split(",")[1] || "").trim();
+        if (d && d.endsWith(q)) set.add(d);
+      }
+      log(`BufferOver added ${set.size - initialSize} new subdomains`);
+    }
+  } catch (e) {
+    logError(`BufferOver lookup failed for ${q}:`, e);
+  }
+
+  // Anubis - subdomain aggregator
+  try {
+    log(`Fetching subdomains from Anubis for ${q}...`);
+    const r = await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (r.ok) {
+      const arr = await r.json();
+      const initialSize = set.size;
+      for (const d of arr) {
+        if (typeof d === "string" && d.endsWith(q)) set.add(d);
+      }
+      log(`Anubis added ${set.size - initialSize} new subdomains`);
+    }
+  } catch (e) {
+    logError(`Anubis lookup failed for ${q}:`, e);
+  }
+
+  log(`Total ${set.size} unique subdomains found for ${q}`);
+  return [...set].slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
 }
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
@@ -150,38 +311,75 @@ function mmh3_32_from_b64(b64){
 // Fetches favicon and computes its mmh3 hash for fingerprinting
 async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
 
-// Secrets scanner - Regex patterns to detect exposed credentials, API keys, and sensitive endpoints
-// Includes patterns for AWS, Google, GitHub, Slack, Discord, Telegram, and more
+// Secrets scanner - Comprehensive patterns for exposed credentials, API keys, and sensitive data
+// Over 40 patterns covering major cloud providers, SaaS platforms, and crypto
 const SECRET_PATTERNS=[
+  // AWS
   {id:"aws_access_key", rx:/AKIA[0-9A-Z]{16}/g},
   {id:"aws_secret_key", rx:/(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)[\s:=]+[A-Za-z0-9\/\+=]{40}/g},
+  {id:"aws_session_token", rx:/(?:aws_session_token|AWS_SESSION_TOKEN)[\s:=]+[A-Za-z0-9\/\+=]{100,}/g},
+  // Google Cloud & Firebase
   {id:"google_api_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
   {id:"google_oauth", rx:/ya29\.[0-9A-Za-z\-_]+/g},
+  {id:"gcp_sa", rx:/[a-z0-9\-]{6,}\@[a-z0-9\-]+\.iam\.gserviceaccount\.com/g},
+  {id:"firebase_db", rx:/https:\/\/[a-z0-9\-]+\.firebaseio\.com/gi},
+  // GitHub
   {id:"github_pat", rx:/(?:ghp|gho|ghu|ghs)_[A-Za-z0-9]{36}/g},
   {id:"github_fine_grained", rx:/github_pat_[A-Za-z0-9_]{22,}/g},
+  {id:"github_oauth", rx:/gho_[0-9A-Za-z]{36}/g},
+  // GitLab
+  {id:"gitlab_pat", rx:/glpat-[0-9A-Za-z\-_]{20,}/g},
+  // Slack
   {id:"slack_token", rx:/xox[baprs]-[A-Za-z0-9\-]{10,48}/g},
   {id:"slack_webhook", rx:/https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{8,}\/B[A-Z0-9]{8,}\/[A-Za-z0-9]{24}/g},
-  {id:"stripe_key", rx:/(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g},
-  {id:"sendgrid_key", rx:/SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}/g},
-  {id:"twilio_sid", rx:/AC[a-f0-9]{32}/gi},
-  {id:"twilio_token", rx:/SK[a-f0-9]{32}/gi},
-  {id:"firebase_key", rx:/AIza[0-9A-Za-z\-_]{35}/g},
-  {id:"firebase_db", rx:/https:\/\/[a-z0-9\-]+\.firebaseio\.com/gi},
+  // Discord
   {id:"discord_token", rx:/[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g},
   {id:"discord_webhook", rx:/https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d{17,19}\/[A-Za-z0-9_\-]{68}/g},
+  // Telegram
   {id:"telegram_bot", rx:/\b\d{8,10}:[A-Za-z0-9_\-]{35}\b/g},
-  {id:"jwt", rx:/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g},
-  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----/g},
-  {id:"gcp_sa", rx:/[a-z0-9\-]{6,}\@[a-z0-9\-]+\.iam\.gserviceaccount\.com/g},
-  {id:"s3_url", rx:/https?:\/\/[a-z0-9\.\-]{3,}\.s3\.amazonaws\.com\/[^\s"'<>()]+/gi},
-  {id:"azure_sas", rx:/(?:sig=)[A-Za-z0-9%]{20,}&(?:se=|\bsv=)/g},
-  {id:"heroku_key", rx:/[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/gi},
-  {id:"mailgun_key", rx:/key-[0-9a-zA-Z]{32}/g},
+  // Payment Processors
+  {id:"stripe_key", rx:/(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,99}/g},
   {id:"paypal_braintree", rx:/access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}/g},
+  {id:"square_token", rx:/sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}/g},
+  // Email & SMS
+  {id:"sendgrid_key", rx:/SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}/g},
+  {id:"mailgun_key", rx:/key-[0-9a-zA-Z]{32}/g},
+  {id:"twilio_sid", rx:/AC[a-f0-9]{32}/gi},
+  {id:"twilio_token", rx:/SK[a-f0-9]{32}/gi},
+  // Cloud Storage
+  {id:"s3_url", rx:/https?:\/\/[a-z0-9\.\-]{3,}\.s3[.\-](?:[a-z0-9\-]+\.)?amazonaws\.com\/[^\s"'<>()]+/gi},
+  {id:"azure_sas", rx:/(?:sig=)[A-Za-z0-9%]{20,}&(?:se=|\bsv=)/g},
+  {id:"gcs_bucket", rx:/https?:\/\/storage\.googleapis\.com\/[a-z0-9\-_.]+/gi},
+  // Heroku & PaaS
+  {id:"heroku_key", rx:/[h|H][e|E][r|R][o|O][k|K][u|U].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}/gi},
+  {id:"doppler_token", rx:/dp\.pt\.[a-zA-Z0-9]{43}/g},
+  // Databases
+  {id:"mongodb_uri", rx:/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi},
+  {id:"postgres_uri", rx:/postgres(?:ql)?:\/\/[^\s"'<>]+/gi},
+  {id:"redis_uri", rx:/redis:\/\/[^\s"'<>]+/gi},
+  {id:"mysql_uri", rx:/mysql:\/\/[^\s"'<>]+/gi},
+  // Auth & JWT
+  {id:"jwt", rx:/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}/g},
+  {id:"bearer_token", rx:/[Bb]earer\s+[A-Za-z0-9\-_=]{20,}/g},
+  {id:"basic_auth", rx:/[Bb]asic\s+[A-Za-z0-9+\/=]{20,}/g},
+  // Private Keys
+  {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP|PRIVATE) (?:PRIVATE )?KEY-----/g},
+  {id:"ssh_key", rx:/ssh-rsa\s+AAAA[0-9A-Za-z+\/]+[=]{0,3}/g},
+  // Crypto & Blockchain
+  {id:"ethereum_key", rx:/0x[a-fA-F0-9]{64}/g},
+  {id:"bitcoin_address", rx:/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g},
+  // Network & Infrastructure
   {id:"internal_ip", rx:/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g},
+  {id:"ipv6_address", rx:/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g},
+  // API Endpoints & Routes
   {id:"endpoint_url", rx:/https?:\/\/[a-z0-9\.\-]+(?::\d{2,5})?(?:\/[A-Za-z0-9_\-\.~%\/\?\=\&#]+)?/gi},
-  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v1|v2|v3|graphql|admin|internal)\/[A-Za-z0-9_\-\/\.]+/gi},
-  {id:"api_key_assign", rx:/(?:api[_-]?key|token|secret|bearer)\s*[:=]\s*["'][^"']{12,}["']/gi}
+  {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v\d+|graphql|admin|internal|wp-json)\/[A-Za-z0-9_\-\/\.]+/gi},
+  {id:"api_key_assign", rx:/(?:api[_-]?key|apikey|token|secret|password|passwd|bearer|auth)[\s]*[:=][\s]*["'][^"']{8,}["']/gi},
+  // Additional Secrets
+  {id:"npm_token", rx:/npm_[A-Za-z0-9]{36}/g},
+  {id:"pypi_token", rx:/pypi-[A-Za-z0-9\-_]{32,}/g},
+  {id:"docker_hub_token", rx:/dckr_pat_[A-Za-z0-9_-]{32,}/g},
+  {id:"datadog_key", rx:/[a-f0-9]{32}(?:-[a-f0-9]{8})?/g}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
 async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await r.text(); return t.slice(0, 300*1024);}catch{ return ""; } }
@@ -210,40 +408,370 @@ async function vtDomain(domain, apiKey){
   if(!r.ok) throw new Error(`VirusTotal HTTP ${r.status}`); const j=await r.json(); const a=j?.data?.attributes||{}; return { reputation:a.reputation??0, last_analysis_stats:a.last_analysis_stats||null, categories:a.categories||null };
 }
 
+// OpenAI API integration for intelligent host filtering and correlation
+async function callOpenAI(apiKey, messages, model = "gpt-4o-mini") {
+  try {
+    const r = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: messages,
+        temperature: 0.3,
+        max_tokens: 2000
+      })
+    }, 15000);
+
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`OpenAI API error ${r.status}: ${err}`);
+    }
+
+    const j = await r.json();
+    return j.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    logError(`OpenAI API call failed:`, e);
+    return null;
+  }
+}
+
+// AI-powered host filtering - uses OpenAI to identify relevant hosts
+async function filterHostsWithAI(apiKey, hosts, targetDomain) {
+  if (!apiKey || !hosts || hosts.length === 0) return hosts;
+
+  try {
+    log(`Using AI to filter ${hosts.length} hosts for ${targetDomain}...`);
+
+    const prompt = `You are a cybersecurity reconnaissance expert. Given the target domain "${targetDomain}", analyze this list of subdomains and identify which ones are RELEVANT for security reconnaissance.
+
+Subdomains found (${hosts.length} total):
+${hosts.slice(0, 200).join('\n')}
+
+Filter OUT:
+- CDN/caching subdomains (cdn, cache, static, assets)
+- Wildcard/test subdomains (test, dev, staging - UNLESS they look production-exposed)
+- Third-party/unrelated services
+- Obvious spam/parked domains
+
+Keep RELEVANT subdomains for:
+- Production services (api, admin, portal, app, www)
+- Authentication/IAM (auth, login, sso, oauth)
+- Internal/staging if production-exposed (vpn, internal, intranet)
+- Interesting infrastructure (mail, mx, smtp, git, jenkins, grafana)
+- Database/backend services (db, sql, mongo, redis)
+
+Respond with ONLY a JSON array of relevant hostnames, no explanation:
+["host1.example.com", "host2.example.com"]
+
+If all should be kept, return all. If none are relevant, return [].`;
+
+    const response = await callOpenAI(apiKey, [
+      { role: "system", content: "You are a cybersecurity expert assistant specializing in reconnaissance and infrastructure analysis. Respond only with valid JSON." },
+      { role: "user", content: prompt }
+    ]);
+
+    if (!response) {
+      log(`AI filtering failed, returning all hosts`);
+      return hosts;
+    }
+
+    // Parse AI response
+    const filtered = JSON.parse(response.trim());
+    if (Array.isArray(filtered)) {
+      log(`AI filtered ${hosts.length} hosts down to ${filtered.length} relevant ones`);
+      return filtered;
+    } else {
+      logError(`AI response was not an array, returning all hosts`);
+      return hosts;
+    }
+  } catch (e) {
+    logError(`AI host filtering failed:`, e);
+    return hosts; // Fallback to all hosts
+  }
+}
+
+// AI-powered correlation - finds connections between different data sources
+async function correlateFindings(apiKey, state) {
+  if (!apiKey || !state) return null;
+
+  try {
+    log(`Using AI to correlate findings for ${state.domain}...`);
+
+    const summary = {
+      domain: state.domain,
+      ips: state.ips || [],
+      subdomains: (state.quickSubs || []).map(s => s.subdomain).slice(0, 50),
+      technologies: (state.tech?.tags || []),
+      secretsCount: (state.secrets || []).length,
+      cveCount: Object.values(state.perIp || {}).reduce((acc, ip) => acc + (ip.cve_enrich?.length || 0), 0),
+      headers: Object.keys(state.headers || {}),
+      hasSecurityTxt: !!state.securityTxt,
+      hasRobots: !!state.robots,
+      dmarcPresent: state.dmarc?.present || false,
+      spfPresent: state.spf?.present || false
+    };
+
+    const prompt = `You are a cybersecurity reconnaissance expert. Analyze these findings for ${state.domain} and provide key insights and correlations:
+
+FINDINGS:
+${JSON.stringify(summary, null, 2)}
+
+Provide a concise analysis covering:
+1. **Security Posture**: Overall security assessment (headers, email security, exposed services)
+2. **Attack Surface**: Interesting entry points, exposed services, potential vulnerabilities
+3. **Infrastructure**: Hosting/CDN, technology stack insights, interesting patterns
+4. **Recommendations**: Top 2-3 areas to investigate further
+
+Respond in markdown format, be concise (max 300 words), focus on actionable intel for red team operators.`;
+
+    const response = await callOpenAI(apiKey, [
+      { role: "system", content: "You are a cybersecurity expert providing reconnaissance analysis for authorized penetration testing." },
+      { role: "user", content: prompt }
+    ]);
+
+    if (response) {
+      log(`AI correlation generated ${response.length} chars of analysis`);
+      return response;
+    }
+
+    return null;
+  } catch (e) {
+    logError(`AI correlation failed:`, e);
+    return null;
+  }
+}
+
+// Enhanced crt.sh background processing with AI filtering
+async function enhancedSubdomainRecon(domain, openaiApiKey) {
+  try {
+    log(`Starting enhanced subdomain recon for ${domain} with AI filtering...`);
+
+    // Get all subdomains from crt.sh (more extensive than normal)
+    const allSubs = await subdomainsPassive(domain);
+    log(`Found ${allSubs.length} total subdomains from passive sources`);
+
+    if (allSubs.length === 0) return [];
+
+    // Use AI to filter relevant hosts
+    const relevantHosts = await filterHostsWithAI(openaiApiKey, allSubs, domain);
+    log(`AI filtered to ${relevantHosts.length} relevant hosts`);
+
+    // Resolve filtered hosts to IPs
+    const resolvedHosts = [];
+    const queue = relevantHosts.slice(0, 100); // Limit to top 100 AI-filtered
+    const limit = CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
+
+    async function worker() {
+      while (queue.length) {
+        const host = queue.shift();
+        try {
+          const a4 = (await dohResolve(host, "A")).filter(x => x.type === 1).map(x => x.data);
+          const a6 = (await dohResolve(host, "AAAA")).filter(x => x.type === 28).map(x => x.data);
+
+          if (a4.length || a6.length) {
+            resolvedHosts.push({
+              subdomain: host,
+              a: a4,
+              aaaa: a6,
+              aiFiltered: true
+            });
+          }
+        } catch (e) {
+          logError(`Failed to resolve ${host}:`, e);
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: limit }, worker));
+    log(`Resolved ${resolvedHosts.length} AI-filtered hosts to IPs`);
+
+    return resolvedHosts;
+  } catch (e) {
+    logError(`Enhanced subdomain recon failed:`, e);
+    return [];
+  }
+}
+
 // CVE enrichment - Converts CPEs (Common Platform Enumeration) from Shodan to CVE IDs with severity scores
 // Uses CIRCL.lu API (primary) with NVD (fallback) for CVE lookups
-const cveCache=new Map();
-function normCVE(items){ const out=[]; for(const it of items||[]){ if(!it) continue; let id = it.id || it.cve?.id || it.cve?.CVE_data_meta?.ID || it.cveId || it.cve?.cveId; if(!id) continue; let score=null, severity=null, published=null, lastModified=null; if("cvss" in it) score=Number(it.cvss)||null; if(typeof it.severity==="string") severity=it.severity; if("Published" in it) published=it.Published; if("Modified" in it) lastModified=it.Modified; const nvd = it.cve || it; try{ const m=nvd.metrics||{}; const v31=m.cvssMetricV31?.[0]?.cvssData; const v30=m.cvssMetricV30?.[0]?.cvssData; const v2=m.cvssMetricV2?.[0]?.cvssData; const pick=v31||v30||v2; if(pick && pick.baseScore!=null){ score=Number(pick.baseScore); severity=pick.baseSeverity||severity; } published=nvd.published||nvd.publishedDate||published; lastModified=nvd.lastModified||nvd.lastModifiedDate||lastModified; }catch{} out.push({id,score,severity,published,lastModified}); } return out; }
-async function cveFromCIRCL(cpe){ try{ const j=await fetchJSON(`https://cve.circl.lu/api/search/cpe/${encodeURIComponent(cpe)}`); return normCVE(j).map(x=>({...x,source:"circl"})); }catch{ return []; } }
-async function cveFromNVD(cpe){ try{ const j=await jsonWithTimeout(`https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(cpe)}&resultsPerPage=50`,{},4000); const arr=(j.vulnerabilities||[]).map(v=>v.cve); return normCVE(arr).map(x=>({...x,source:"nvd"})); }catch{ return []; } }
-async function enrichCVEsForCPE(cpe){ if(cveCache.has(cpe)) return cveCache.get(cpe); let items=await cveFromCIRCL(cpe); if(!items.length) items=await cveFromNVD(cpe); items.sort((a,b)=>(Number(b.score||0)-Number(a.score||0))); const top=items.slice(0,30); cveCache.set(cpe,top); return top; }
+const cveCache = new Map();
+
+function normCVE(items) {
+  const out = [];
+  for (const it of items || []) {
+    if (!it) continue;
+    let id = it.id || it.cve?.id || it.cve?.CVE_data_meta?.ID || it.cveId || it.cve?.cveId;
+    if (!id) continue;
+
+    let score = null, severity = null, published = null, lastModified = null;
+    if ("cvss" in it) score = Number(it.cvss) || null;
+    if (typeof it.severity === "string") severity = it.severity;
+    if ("Published" in it) published = it.Published;
+    if ("Modified" in it) lastModified = it.Modified;
+
+    const nvd = it.cve || it;
+    try {
+      const m = nvd.metrics || {};
+      const v31 = m.cvssMetricV31?.[0]?.cvssData;
+      const v30 = m.cvssMetricV30?.[0]?.cvssData;
+      const v2 = m.cvssMetricV2?.[0]?.cvssData;
+      const pick = v31 || v30 || v2;
+      if (pick && pick.baseScore != null) {
+        score = Number(pick.baseScore);
+        severity = pick.baseSeverity || severity;
+      }
+      published = nvd.published || nvd.publishedDate || published;
+      lastModified = nvd.lastModified || nvd.lastModifiedDate || lastModified;
+    } catch (e) {
+      logError(`Error parsing CVE metrics for ${id}:`, e);
+    }
+    out.push({ id, score, severity, published, lastModified });
+  }
+  return out;
+}
+
+async function cveFromCIRCL(cpe) {
+  try {
+    log(`Fetching CVEs from CIRCL for CPE: ${cpe}`);
+    const j = await fetchJSON(`https://cve.circl.lu/api/search/cpe/${encodeURIComponent(cpe)}`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
+    const cves = normCVE(j).map(x => ({ ...x, source: "circl" }));
+    log(`CIRCL returned ${cves.length} CVEs for ${cpe}`);
+    return cves;
+  } catch (e) {
+    logError(`CIRCL CVE lookup failed for ${cpe}:`, e);
+    return [];
+  }
+}
+
+async function cveFromNVD(cpe) {
+  try {
+    log(`Fetching CVEs from NVD for CPE: ${cpe}`);
+    const j = await fetchJSON(`https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(cpe)}&resultsPerPage=50`, {}, CONFIG.TIMEOUTS.CVE_NVD);
+    const arr = (j.vulnerabilities || []).map(v => v.cve);
+    const cves = normCVE(arr).map(x => ({ ...x, source: "nvd" }));
+    log(`NVD returned ${cves.length} CVEs for ${cpe}`);
+    return cves;
+  } catch (e) {
+    logError(`NVD CVE lookup failed for ${cpe}:`, e);
+    return [];
+  }
+}
+
+async function enrichCVEsForCPE(cpe) {
+  if (!cpe) return [];
+  if (cveCache.has(cpe)) {
+    log(`Using cached CVEs for ${cpe}`);
+    return cveCache.get(cpe);
+  }
+
+  let items = await cveFromCIRCL(cpe);
+  if (!items.length) {
+    log(`CIRCL had no results, falling back to NVD for ${cpe}`);
+    items = await cveFromNVD(cpe);
+  }
+
+  items.sort((a, b) => (Number(b.score || 0) - Number(a.score || 0)));
+  const top = items.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS / 2);
+  cveCache.set(cpe, top);
+  log(`Cached ${top.length} CVEs for ${cpe}`);
+  return top;
+}
 
 // state
 const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${tabId}`]: data });
 const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
 async function patchState(tabId, patch){ const cur=await getTabData(tabId)||{}; const next=merge(cur,patch); await setTabData(tabId,next); return next; }
 
-// tech heuristics
+// Technology detection - Comprehensive fingerprinting from headers, meta tags, and DOM hints
 function detectTech({headers={}, meta={}, domHints={}, faviconHash}){
   const tags=new Set(); const notes=[];
   const H = (k)=>headers[k] || headers[k?.toLowerCase?.()] || null;
-  const server=H("server")||""; const via=H("via")||""; const powered=H("x-powered-by")||""; const gen=(meta?.generator||"").toLowerCase(); const paths=(domHints?.paths||[]).join(" ");
-  if(/cloudflare/i.test(server) || headers["cf-ray"]) tags.add("Cloudflare");
+  const server=H("server")||""; const via=H("via")||""; const powered=H("x-powered-by")||"";
+  const gen=(meta?.generator||"").toLowerCase(); const paths=(domHints?.paths||[]).join(" ");
+  const hStr = JSON.stringify(headers).toLowerCase();
+
+  // CDN & Edge
+  if(/cloudflare/i.test(server) || H("cf-ray")) tags.add("Cloudflare");
   if(/fastly|varnish/i.test(server)) tags.add("Fastly");
   if(/akamai/i.test(server) || /akamai/i.test(via)) tags.add("Akamai");
-  if(/vercel/i.test(server) || /x-vercel-id/i.test(JSON.stringify(headers))) tags.add("Vercel");
+  if(/cloudfront|x-amz-cf-id/i.test(hStr)) tags.add("AWS CloudFront");
+  if(/bunnycdn/i.test(hStr)) tags.add("BunnyCDN");
+  if(/stackpath|netdna/i.test(server)) tags.add("StackPath");
+
+  // Hosting Platforms
+  if(/vercel/i.test(server) || /x-vercel-id/i.test(hStr)) tags.add("Vercel");
   if(/github-pages|GitHub\.com/i.test(server)) tags.add("GitHub Pages");
-  if(/Netlify|x-nf-request-id/i.test(JSON.stringify(headers))) tags.add("Netlify");
-  if(/wordpress/i.test(gen) || /wp-content|wp-includes/i.test(paths)) tags.add("WordPress");
+  if(/Netlify|x-nf-request-id/i.test(hStr)) tags.add("Netlify");
+  if(/WP Engine/i.test(hStr)) tags.add("WP Engine");
+  if(/x-kinsta/i.test(hStr)) tags.add("Kinsta");
+
+  // CMS & Frameworks
+  if(/wordpress/i.test(gen) || /wp-content|wp-includes|wp-json/i.test(paths)) tags.add("WordPress");
   if(/drupal/i.test(gen) || /drupal/i.test(paths)) tags.add("Drupal");
+  if(/joomla/i.test(gen) || /joomla/i.test(paths)) tags.add("Joomla");
+  if(/wix\.com/i.test(hStr)) tags.add("Wix");
+  if(/squarespace/i.test(hStr)) tags.add("Squarespace");
+  if(/shopify/i.test(hStr)) tags.add("Shopify");
+  if(/magento/i.test(powered) || /mage/i.test(paths)) tags.add("Magento");
+  if(/prestashop/i.test(gen)) tags.add("PrestaShop");
+  if(/webflow/i.test(hStr)) tags.add("Webflow");
+
+  // JavaScript Frameworks
   if(/next\.js/i.test(powered) || /_next\//i.test(paths)) tags.add("Next.js");
-  if(/_nuxt\//i.test(paths)) tags.add("Nuxt");
-  if(/express/i.test(powered)) tags.add("Express");
-  if(/php/i.test(powered) || /\.php\b/i.test(paths)) tags.add("PHP");
-  if(/asp\.net|microsoft/i.test(powered) || /x-aspnet/i.test(JSON.stringify(headers))) tags.add("ASP.NET");
-  if(/rails/i.test(powered) || /_rails_session/i.test(JSON.stringify(headers))) tags.add("Rails");
+  if(/_nuxt\//i.test(paths) || /nuxt/i.test(powered)) tags.add("Nuxt.js");
+  if(/gatsby/i.test(gen) || /gatsby/i.test(paths)) tags.add("Gatsby");
+  if(/angular/i.test(paths) || /ng-/i.test(hStr)) tags.add("Angular");
+  if(/react/i.test(paths)) tags.add("React");
+  if(/vue\.js/i.test(paths) || /vuejs/i.test(hStr)) tags.add("Vue.js");
+  if(/svelte/i.test(paths)) tags.add("Svelte");
+  if(/ember/i.test(paths)) tags.add("Ember.js");
+
+  // Backend/Server
+  if(/express/i.test(powered)) tags.add("Express.js");
+  if(/nginx/i.test(server)) tags.add("Nginx");
+  if(/apache/i.test(server)) tags.add("Apache");
+  if(/iis|microsoft/i.test(server)) tags.add("IIS");
+  if(/kestrel/i.test(server)) tags.add("Kestrel");
+  if(/litespeed/i.test(server)) tags.add("LiteSpeed");
+  if(/tomcat/i.test(server)) tags.add("Apache Tomcat");
+  if(/jetty/i.test(server)) tags.add("Jetty");
+  if(/gunicorn/i.test(server)) tags.add("Gunicorn");
+  if(/uwsgi/i.test(server)) tags.add("uWSGI");
+  if(/passenger/i.test(server)) tags.add("Phusion Passenger");
+
+  // Languages & Runtimes
+  if(/php/i.test(powered) || /\.php\b/i.test(paths) || /x-php/i.test(hStr)) tags.add("PHP");
+  if(/asp\.net|microsoft/i.test(powered) || /x-aspnet/i.test(hStr)) tags.add("ASP.NET");
+  if(/rails/i.test(powered) || /_rails_session/i.test(hStr)) tags.add("Ruby on Rails");
+  if(/django/i.test(powered) || /csrftoken|django/i.test(hStr)) tags.add("Django");
+  if(/flask/i.test(powered)) tags.add("Flask");
+  if(/laravel/i.test(powered) || /laravel/i.test(paths)) tags.add("Laravel");
+  if(/symfony/i.test(powered) || /symfony/i.test(paths)) tags.add("Symfony");
+  if(/spring/i.test(powered) || /jsessionid/i.test(hStr)) tags.add("Spring");
+  if(/\.jsp\b/i.test(paths)) tags.add("JSP/Java");
+  if(/\.aspx\b/i.test(paths)) tags.add("ASP.NET");
+  if(/\.cfm\b/i.test(paths)) tags.add("ColdFusion");
+
+  // WAF & Security
+  if(/x-sucuri/i.test(hStr)) tags.add("Sucuri WAF");
+  if(/wordfence/i.test(hStr)) tags.add("Wordfence");
+  if(/x-powered-by-plesk/i.test(hStr)) tags.add("Plesk");
+  if(/cpanel/i.test(hStr)) tags.add("cPanel");
+
+  // Analytics & Tracking
+  if(/google-site-verification/i.test(hStr)) notes.push("Google Site Verification");
+  if(/google-analytics|gtag|ga\.js/i.test(paths)) notes.push("Google Analytics");
+  if(/facebook\.net|fbevents/i.test(paths)) notes.push("Facebook Pixel");
+
+  // Additional Info
   if(typeof faviconHash==="number") notes.push(`favicon mmh3: ${faviconHash}`);
-  return { tags: Array.from(tags).slice(0,12), notes };
+  if(H("x-cache")) notes.push(`Cache: ${H("x-cache")}`);
+  if(H("x-runtime")) notes.push(`Runtime: ${H("x-runtime")}`);
+
+  return { tags: Array.from(tags).slice(0,25), notes };
 }
 
 // content bridge
@@ -306,29 +834,105 @@ async function analyze(tabId, url){
 
     await setTabData(tabId, { url, domain, headers: hdrSnap?hdrSnap.headers:{}, ts: Date.now() });
 
-    // IPs
+    // IPs - Resolve and enrich with all available data
     (async () => {
-      const ips = await resolveIPs(domain);
-      const perIp = {};
-      await Promise.all(ips.map(async (ip) => {
-        const [internetdb, ipwhois, iprdap, ptr] = await Promise.allSettled([ shodanInternetDB(ip), ipWhoIs(ip), rdapIP(ip), reverseDNS(ip) ]);
-        perIp[ip] = { internetdb: internetdb.value||{}, ipwhois: ipwhois.value||{}, rdap: iprdap.value||null, rdns: ptr.value||null, cve_enrich: null };
-      }));
-      await patchState(tabId, { ips, perIp });
-
-      // CVE enrichment
-      (async () => {
-        const current = await getTabData(tabId); if(!current?.perIp) return;
-        for (const ip of Object.keys(current.perIp)) {
-          try {
-            const s = current.perIp[ip]?.internetdb || {}; const cpes = Array.isArray(s.cpes) ? s.cpes.slice(0,5) : [];
-            let agg = [];
-            for (const c of cpes){ const list = await enrichCVEsForCPE(c); agg = agg.concat(list); if (agg.length>=60) break; }
-            const seen=new Set(); const dedup=[]; for(const it of agg){ if(!seen.has(it.id)){ seen.add(it.id); dedup.push(it);} }
-            const upd = await getTabData(tabId); if(!upd?.perIp?.[ip]) continue; upd.perIp[ip].cve_enrich = dedup.slice(0,60); await setTabData(tabId, upd);
-          } catch {}
+      try {
+        log(`Starting IP resolution for ${domain}...`);
+        const ips = await resolveIPs(domain);
+        if (!ips || ips.length === 0) {
+          log(`No IPs resolved for ${domain}`);
+          await patchState(tabId, { ips: [], perIp: {} });
+          return;
         }
-      })();
+        log(`Resolved ${ips.length} IPs for ${domain}: ${ips.join(', ')}`);
+
+        const perIp = {};
+        await Promise.all(ips.map(async (ip) => {
+          try {
+            log(`Enriching IP: ${ip}...`);
+            const [internetdb, ipwhois, iprdap, ptr] = await Promise.allSettled([
+              shodanInternetDB(ip),
+              ipWhoIs(ip),
+              rdapIP(ip),
+              reverseDNS(ip)
+            ]);
+
+            perIp[ip] = {
+              internetdb: internetdb.status === 'fulfilled' ? (internetdb.value || {}) : {},
+              ipwhois: ipwhois.status === 'fulfilled' ? (ipwhois.value || {}) : {},
+              rdap: iprdap.status === 'fulfilled' ? iprdap.value : null,
+              rdns: ptr.status === 'fulfilled' ? ptr.value : null,
+              cve_enrich: null
+            };
+            log(`IP ${ip} enrichment complete`);
+          } catch (e) {
+            logError(`Failed to enrich IP ${ip}:`, e);
+            perIp[ip] = { internetdb: {}, ipwhois: {}, rdap: null, rdns: null, cve_enrich: null };
+          }
+        }));
+
+        await patchState(tabId, { ips, perIp });
+        log(`IP enrichment complete for ${domain}`);
+
+        // CVE enrichment - Background task for CPE → CVE lookup
+        (async () => {
+          try {
+            log(`Starting CVE enrichment for ${domain}...`);
+            const current = await getTabData(tabId);
+            if (!current?.perIp) {
+              log(`No perIp data found, skipping CVE enrichment`);
+              return;
+            }
+
+            for (const ip of Object.keys(current.perIp)) {
+              try {
+                const ipData = current.perIp[ip];
+                if (!ipData?.internetdb) continue;
+
+                const s = ipData.internetdb || {};
+                const cpes = Array.isArray(s.cpes) ? s.cpes.slice(0, CONFIG.LIMITS.MAX_CPES_PER_IP) : [];
+
+                if (cpes.length === 0) {
+                  log(`No CPEs found for IP ${ip}`);
+                  continue;
+                }
+
+                log(`Found ${cpes.length} CPEs for IP ${ip}, enriching...`);
+                let agg = [];
+                for (const c of cpes) {
+                  const list = await enrichCVEsForCPE(c);
+                  agg = agg.concat(list);
+                  if (agg.length >= CONFIG.LIMITS.MAX_CVE_RESULTS) break;
+                }
+
+                // Deduplicate CVEs
+                const seen = new Set();
+                const dedup = [];
+                for (const it of agg) {
+                  if (it && it.id && !seen.has(it.id)) {
+                    seen.add(it.id);
+                    dedup.push(it);
+                  }
+                }
+
+                const upd = await getTabData(tabId);
+                if (!upd?.perIp?.[ip]) continue;
+                upd.perIp[ip].cve_enrich = dedup.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS);
+                await setTabData(tabId, upd);
+                log(`CVE enrichment complete for IP ${ip}: ${dedup.length} CVEs`);
+              } catch (e) {
+                logError(`CVE enrichment failed for IP ${ip}:`, e);
+              }
+            }
+            log(`CVE enrichment complete for all IPs`);
+          } catch (e) {
+            logError(`CVE enrichment process failed:`, e);
+          }
+        })();
+      } catch (e) {
+        logError(`IP resolution/enrichment failed for ${domain}:`, e);
+        await patchState(tabId, { ips: [], perIp: {}, error: `IP resolution failed: ${e.message}` });
+      }
     })();
 
     // Domain posture
@@ -343,6 +947,31 @@ async function analyze(tabId, url){
       await patchState(tabId, { quickSubs: liveSubs });
     })();
 
+    // AI-Enhanced Subdomain Recon (background task)
+    (async () => {
+      try {
+        const { openaiApiKey: saved } = await chrome.storage.local.get(["openaiApiKey"]);
+        let apiKey = saved;
+        if (!apiKey) {
+          try {
+            const cfg = await (await fetch(chrome.runtime.getURL("config.json"))).json();
+            apiKey = cfg.openaiApiKey || "";
+          } catch {}
+        }
+
+        if (apiKey) {
+          log(`OpenAI API key found, starting AI-enhanced subdomain recon...`);
+          const enhancedSubs = await enhancedSubdomainRecon(domain, apiKey);
+          await patchState(tabId, { aiEnhancedSubs: enhancedSubs });
+          log(`AI-enhanced subdomain recon complete: ${enhancedSubs.length} relevant hosts`);
+        } else {
+          log(`No OpenAI API key configured, skipping AI-enhanced recon`);
+        }
+      } catch (e) {
+        logError(`AI-enhanced subdomain recon failed:`, e);
+      }
+    })();
+
     // Secrets if resources already here
     const res = resourcesByTab.get(tabId);
     if (res) {
@@ -353,6 +982,37 @@ async function analyze(tabId, url){
       const tech = detectTech({ headers: (await getTabData(tabId))?.headers || {}, meta: res.meta||{}, domHints: res.domHints||{}, faviconHash: fav });
       await patchState(tabId, { tech });
     }
+
+    // AI Correlation (background task - runs after all data collected)
+    (async () => {
+      try {
+        // Wait a bit for other recon to complete
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        const { openaiApiKey: saved } = await chrome.storage.local.get(["openaiApiKey"]);
+        let apiKey = saved;
+        if (!apiKey) {
+          try {
+            const cfg = await (await fetch(chrome.runtime.getURL("config.json"))).json();
+            apiKey = cfg.openaiApiKey || "";
+          } catch {}
+        }
+
+        if (apiKey) {
+          const currentState = await getTabData(tabId);
+          if (currentState) {
+            log(`Starting AI correlation for ${domain}...`);
+            const correlation = await correlateFindings(apiKey, currentState);
+            if (correlation) {
+              await patchState(tabId, { aiCorrelation: correlation });
+              log(`AI correlation complete for ${domain}`);
+            }
+          }
+        }
+      } catch (e) {
+        logError(`AI correlation failed:`, e);
+      }
+    })();
 
   }catch(e){ await setTabData(tabId, { url, error: String(e) }); }
 }

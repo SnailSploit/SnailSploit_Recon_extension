@@ -84,18 +84,55 @@ function techCard(s){
   return card;
 }
 
+function aiCorrelationCard(s){
+  const card=el(`<div class="card"><h3>🤖 AI Correlation & Insights</h3></div>`);
+  if(!s.aiCorrelation){
+    card.appendChild(el('<div class="small">AI analysis running in background... (requires OpenAI API key in Options)</div>'));
+    return card;
+  }
+  // Parse markdown and display
+  const content = s.aiCorrelation.split('\n').map(line => {
+    if(line.startsWith('###')) return `<h4 style="margin:8px 0 4px 0;font-size:11px">${esc(line.replace(/^###\s*/,''))}</h4>`;
+    if(line.startsWith('##')) return `<h4 style="margin:10px 0 6px 0;font-size:12px;font-weight:bold">${esc(line.replace(/^##\s*/,''))}</h4>`;
+    if(line.startsWith('- ')) return `<div class="small" style="margin-left:12px">• ${esc(line.replace(/^-\s*/,''))}</div>`;
+    if(line.trim()) return `<div class="small">${esc(line)}</div>`;
+    return '';
+  }).join('');
+  card.innerHTML += content;
+  return card;
+}
+
+function aiEnhancedSubsCard(s){
+  const card=el(`<div class="card"><h3>🎯 AI-Filtered Relevant Hosts</h3><div id="aiSubs"></div></div>`);
+  const box=card.querySelector("#aiSubs");
+  const subs=s.aiEnhancedSubs||[];
+  if(!subs || subs.length === 0){
+    box.appendChild(el('<div class="small">AI host filtering running in background... (requires OpenAI API key)</div>'));
+    return card;
+  }
+  box.appendChild(el(`<div class="small" style="margin-bottom:8px">AI identified ${subs.length} highly relevant hosts from passive recon</div>`));
+  for(const it of subs.slice(0,50)){
+    const ips = (it.a||[]).concat(it.aaaa||[]).map(ip=>`<span class="chip">${esc(ip)}</span>`).join(" ");
+    const row = el(`<div class="sub"><div class="mono">${esc(it.subdomain)}</div><div>${ips||'<span class="small">no IPs?</span>'}</div><span class="chip" style="background:#e8f5e9;border-color:#4caf50;color:#2e7d32">AI Filtered</span></div>`);
+    box.appendChild(row);
+  }
+  return card;
+}
+
 async function render(){
   const root=document.getElementById("root"); const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
   if(!s){ root.textContent="No data yet. Reload the page."; return; } if(s.error){ root.textContent=`Error: ${s.error}`; return; }
   root.appendChild(headerCard(s));
   root.appendChild(headersCard(s.headers));
   root.appendChild(techCard(s));
+  if(s.aiCorrelation) root.appendChild(aiCorrelationCard(s));
   root.appendChild(ipsCard(s));
   root.appendChild(domainCard(s));
   root.appendChild(mailCard(s));
   root.appendChild(textsCard(s));
   root.appendChild(secretsCard(s));
   root.appendChild(subsCard(s));
+  if(s.aiEnhancedSubs && s.aiEnhancedSubs.length > 0) root.appendChild(aiEnhancedSubsCard(s));
   root.appendChild(exportCard(s));
 }
 
