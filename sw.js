@@ -33,12 +33,27 @@ const CONFIG = {
     MAX_ATTEMPTS: 3,
     INITIAL_DELAY: 500,
     MAX_DELAY: 4000
+  },
+  CACHE: {
+    DOH_MS: 5 * 60 * 1000,
+    SUBDOMAIN_MS: 10 * 60 * 1000,
+    MAX_ENTRIES: 128
   }
 };
 
 function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
 function logError(...a){ try{ console.error("[SnailSploit Recon ERROR]", ...a);}catch{} }
 const merge = (a,b)=>Object.assign({},a||{},b||{});
+const dohCache = new Map();
+const subdomainCache = new Map();
+const highlightTimers = new Map();
+function setBoundedCache(map, key, value){
+  map.set(key, value);
+  if (map.size > CONFIG.CACHE.MAX_ENTRIES) {
+    const first = map.keys().next().value;
+    if (first !== undefined) map.delete(first);
+  }
+}
 
 // Exponential backoff retry helper
 async function retryWithBackoff(fn, maxAttempts = CONFIG.RETRY.MAX_ATTEMPTS, operation = "operation") {
@@ -100,14 +115,27 @@ async function fetchHeadersFallback(url){
 // DNS resolution via DNS-over-HTTPS (DoH) - Uses Google and Cloudflare public resolvers
 // Avoids chrome.dns API requirement, making extension work on Chrome Stable
 async function dohResolve(name, type){
+  const key = `${name}|${type}`;
+  const now = Date.now();
+  const cached = dohCache.get(key);
+  if (cached && (now - cached.ts) < CONFIG.CACHE.DOH_MS) return cached.ans;
   const enc = encodeURIComponent(name);
   const urls = [
     `https://dns.google/resolve?name=${enc}&type=${type}`,
     `https://cloudflare-dns.com/dns-query?name=${enc}&type=${type}`
   ];
   for (const u of urls) {
-    try { const r = await fetchWithTimeout(u, { headers:{accept:"application/dns-json"} }, 2500); if (!r.ok) continue; const j=await r.json(); if (j.Answer && j.Answer.length) return j.Answer; } catch {}
+    try {
+      const r = await fetchWithTimeout(u, { headers:{accept:"application/dns-json"} }, 2500);
+      if (!r.ok) continue;
+      const j=await r.json();
+      if (j.Answer && j.Answer.length) {
+        setBoundedCache(dohCache, key, { ts: now, ans: j.Answer });
+        return j.Answer;
+      }
+    } catch {}
   }
+  setBoundedCache(dohCache, key, { ts: now, ans: [] });
   return [];
 }
 async function dohTXT(name){ const ans=await dohResolve(name,"TXT"); const out=[]; for(const a of ans){ if(a.type!==16) continue; let d=a.data||""; d=d.replace(/^\"|\"$/g,"").replace(/\"\\s+\"?/g,""); out.push(d);} return out; }
@@ -219,6 +247,11 @@ async function checkDKIM(d){ const found=[]; for(const sel of COMMON_DKIM){ try{
 // Then performs active DNS resolution to verify live subdomains
 async function subdomainsPassive(domain){
   const set = new Set(); const q = domain.replace(/^\*\./, "");
+  const cached = subdomainCache.get(q);
+  if (cached && (Date.now() - cached.ts) < CONFIG.CACHE.SUBDOMAIN_MS) {
+    log(`Using cached subdomains for ${q}`);
+    return cached.data.slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
+  }
 
   // crt.sh - certificate transparency logs
   try {
@@ -285,7 +318,9 @@ async function subdomainsPassive(domain){
   }
 
   log(`Total ${set.size} unique subdomains found for ${q}`);
-  return [...set].slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
+  const list = [...set].slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
+  setBoundedCache(subdomainCache, q, { ts: Date.now(), data: list });
+  return list;
 }
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
@@ -774,6 +809,58 @@ function detectTech({headers={}, meta={}, domHints={}, faviconHash}){
   return { tags: Array.from(tags).slice(0,25), notes };
 }
 
+function deriveHighlights(state){
+  if(!state) return null;
+  const items = [];
+  const headers = state.headers || {};
+  const perIp = state.perIp || {};
+  const secrets = state.secrets || [];
+
+  const missingHeaders = ["content-security-policy","strict-transport-security","x-frame-options","x-content-type-options","referrer-policy"].filter(h=>!headers[h]);
+  if(missingHeaders.length) items.push({ severity:"high", title:"Missing security headers", detail: missingHeaders.join(", ") });
+
+  const dmarc = state.dmarc; const spf = state.spf;
+  if(dmarc && !dmarc.present) items.push({ severity:"medium", title:"DMARC not found", detail:"Email spoofing resilience unknown" });
+  if(spf && !spf.present) items.push({ severity:"low", title:"SPF missing", detail:"Sender validation record not found" });
+
+  const openPorts = new Set(); const riskyPorts = new Set();
+  const highCves = [];
+  for(const [ip,data] of Object.entries(perIp)){
+    const ports = Array.isArray(data?.internetdb?.ports) ? data.internetdb.ports : [];
+    ports.forEach(p=>{ openPorts.add(p); if(![80,443,8080,8443].includes(Number(p))) riskyPorts.add(p); });
+    const cves = Array.isArray(data?.cve_enrich) ? data.cve_enrich : [];
+    cves.filter(c=>Number(c.score||0) >= 7).slice(0,5).forEach(c=>highCves.push(c.id));
+  }
+  if(riskyPorts.size) items.push({ severity:"high", title:"Non-standard exposed ports", detail:[...riskyPorts].slice(0,10).map(p=>`:${p}`).join(" ") });
+  else if(openPorts.size) items.push({ severity:"medium", title:"Open ports observed", detail:[...openPorts].slice(0,10).map(p=>`:${p}`).join(" ") });
+  if(highCves.length) items.push({ severity:"critical", title:"High-severity CVEs from CPEs", detail: [...new Set(highCves)].slice(0,8).join(", ") });
+
+  if(secrets.length) items.push({ severity:"high", title:"Potential secrets/endpoints", detail:`${secrets.length} sources flagged` });
+
+  const aiHosts = Array.isArray(state.aiEnhancedSubs) ? state.aiEnhancedSubs.length : 0;
+  if(aiHosts) items.push({ severity:"medium", title:"AI-relevant hosts", detail:`${aiHosts} prioritized subdomains` });
+
+  const quickSubs = Array.isArray(state.quickSubs) ? state.quickSubs.length : 0;
+  if(quickSubs > 20) items.push({ severity:"low", title:"Broad attack surface", detail:`${quickSubs} live subdomains resolved` });
+
+  if(!state.securityTxt) items.push({ severity:"low", title:"security.txt not found", detail:"No disclosure policy located" });
+
+  return { items: items.slice(0, 8) };
+}
+
+function scheduleHighlights(tabId){
+  if(highlightTimers.has(tabId)) return;
+  const timer = setTimeout(async()=>{
+    highlightTimers.delete(tabId);
+    try{
+      const state = await getTabData(tabId);
+      const highlights = deriveHighlights(state);
+      if(highlights) await patchState(tabId, { highlights });
+    }catch(e){ logError("Highlight generation failed", e); }
+  }, 400);
+  highlightTimers.set(tabId, timer);
+}
+
 // content bridge
 const resourcesByTab = new Map();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -787,13 +874,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const fav = base.faviconHash;
             const tech = detectTech({ headers: base.headers || {}, meta: msg.meta || {}, domHints: msg.domHints || {}, faviconHash: fav });
             await patchState(sender.tab.id, { tech });
+            scheduleHighlights(sender.tab.id);
           } catch {}
           await runSecretsScan(sender.tab.id, base, msg, new URL(base.url).origin);
+          scheduleHighlights(sender.tab.id);
           const mapFinds = await probeSourceMaps(Array.isArray(msg.externalScripts)?msg.externalScripts:[]);
           if (mapFinds.length) {
             const fresh = await getTabData(sender.tab.id);
             const merged = (fresh.secrets || []).concat(mapFinds);
             await patchState(sender.tab.id, { secrets: merged });
+            scheduleHighlights(sender.tab.id);
           }
         }
         sendResponse({ ok: true });
@@ -811,6 +901,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           const rep = await vtDomain(sub, apiKey);
           await patchState(msg.tabId, { vt: merge((state&&state.vt)||{}, { [sub]: rep }) });
+          scheduleHighlights(msg.tabId);
           sendResponse({ ok: true, data: rep });
         } catch (e) {
           sendResponse({ ok: false, error: String(e) });
@@ -833,6 +924,7 @@ async function analyze(tabId, url){
     if(!hdrSnap){ try{ const h=await fetchHeadersFallback(url); if(h) hdrSnap={url, headers:h}; }catch{} }
 
     await setTabData(tabId, { url, domain, headers: hdrSnap?hdrSnap.headers:{}, ts: Date.now() });
+    scheduleHighlights(tabId);
 
     // IPs - Resolve and enrich with all available data
     (async () => {
@@ -872,6 +964,7 @@ async function analyze(tabId, url){
         }));
 
         await patchState(tabId, { ips, perIp });
+        scheduleHighlights(tabId);
         log(`IP enrichment complete for ${domain}`);
 
         // CVE enrichment - Background task for CPE → CVE lookup
@@ -919,6 +1012,7 @@ async function analyze(tabId, url){
                 if (!upd?.perIp?.[ip]) continue;
                 upd.perIp[ip].cve_enrich = dedup.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS);
                 await setTabData(tabId, upd);
+                scheduleHighlights(tabId);
                 log(`CVE enrichment complete for IP ${ip}: ${dedup.length} CVEs`);
               } catch (e) {
                 logError(`CVE enrichment failed for IP ${ip}:`, e);
@@ -939,12 +1033,14 @@ async function analyze(tabId, url){
     (async () => {
       const [domainRDAP, robots, secTxt, dmarc, spf, dkim, mx] = await Promise.allSettled([ rdapDomain(domain), getRobots(u.origin), getSecurityTxt(u.origin), checkDMARC(domain), checkSPF(domain), checkDKIM(domain), dohMX(domain) ]);
       await patchState(tabId, { domainRDAP: domainRDAP.value||null, robots: robots.value||null, securityTxt: secTxt.value||null, dmarc: dmarc.value||null, spf: spf.value||null, dkim: dkim.value||null, mx: mx.value||null });
+      scheduleHighlights(tabId);
     })();
 
     // Subdomains
     (async () => {
       const liveSubs = await subdomainsLive(domain);
       await patchState(tabId, { quickSubs: liveSubs });
+      scheduleHighlights(tabId);
     })();
 
     // AI-Enhanced Subdomain Recon (background task)
@@ -963,6 +1059,7 @@ async function analyze(tabId, url){
           log(`OpenAI API key found, starting AI-enhanced subdomain recon...`);
           const enhancedSubs = await enhancedSubdomainRecon(domain, apiKey);
           await patchState(tabId, { aiEnhancedSubs: enhancedSubs });
+          scheduleHighlights(tabId);
           log(`AI-enhanced subdomain recon complete: ${enhancedSubs.length} relevant hosts`);
         } else {
           log(`No OpenAI API key configured, skipping AI-enhanced recon`);
@@ -981,6 +1078,7 @@ async function analyze(tabId, url){
       const fav = (await getTabData(tabId))?.faviconHash || null;
       const tech = detectTech({ headers: (await getTabData(tabId))?.headers || {}, meta: res.meta||{}, domHints: res.domHints||{}, faviconHash: fav });
       await patchState(tabId, { tech });
+      scheduleHighlights(tabId);
     }
 
     // AI Correlation (background task - runs after all data collected)
@@ -1005,6 +1103,7 @@ async function analyze(tabId, url){
             const correlation = await correlateFindings(apiKey, currentState);
             if (correlation) {
               await patchState(tabId, { aiCorrelation: correlation });
+              scheduleHighlights(tabId);
               log(`AI correlation complete for ${domain}`);
             }
           }
