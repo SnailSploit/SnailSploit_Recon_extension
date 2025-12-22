@@ -8,6 +8,29 @@ function headerCard(s){
   const fav = (typeof s.faviconHash==="number") ? `<span class="small">favicon mmh3: <code>${s.faviconHash}</code></span>` : "";
   return el(`<div class="card"><div><b>${esc(s.domain||"")}</b><div class="small">${esc(s.url||"")}</div>${fav}</div></div>`);
 }
+function severityStyle(level){
+  const map={
+    critical:"background:#ffebee;border-color:#ef5350;color:#b71c1c",
+    high:"background:#fff3e0;border-color:#fb8c00;color:#e65100",
+    medium:"background:#fff8e1;border-color:#fdd835;color:#f9a825",
+    low:"background:#f5f5f5;border-color:#bdbdbd;color:#424242"
+  };
+  return map[level] || map.low;
+}
+function highlightsCard(s){
+  const card=el(`<div class="card"><h3>🔎 Pentester Highlights</h3></div>`);
+  const items = s.highlights?.items || [];
+  if(!items.length){ card.appendChild(el('<div class="small">Collecting signals…</div>')); return card; }
+  for(const it of items){
+    const sev=it.severity||"low";
+    const row=el(`<div class="row" style="margin:6px 0;display:flex;gap:8px;align-items:center">
+      <span class="chip" style="${severityStyle(sev)};font-weight:bold;text-transform:uppercase">${esc(sev)}</span>
+      <div><div><b>${esc(it.title||"")}</b></div>${it.detail?`<div class="small">${esc(it.detail)}</div>`:""}</div>
+    </div>`);
+    card.appendChild(row);
+  }
+  return card;
+}
 function headersCard(h){
   const map={"Content-Security-Policy":h?.["content-security-policy"],"Strict-Transport-Security":h?.["strict-transport-security"],"X-Frame-Options":h?.["x-frame-options"],"X-Content-Type-Options":h?.["x-content-type-options"],"Referrer-Policy":h?.["referrer-policy"],"Permissions-Policy":h?.["permissions-policy"],"Server":h?.["server"],"Alt-Svc":h?.["alt-svc"]};
   const card=el(`<div class="card"><h3>Security Headers</h3><div class="grid" id="hdr"></div></div>`); const box=card.querySelector("#hdr");
@@ -123,6 +146,7 @@ async function render(){
   const root=document.getElementById("root"); const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
   if(!s){ root.textContent="No data yet. Reload the page."; return; } if(s.error){ root.textContent=`Error: ${s.error}`; return; }
   root.appendChild(headerCard(s));
+  root.appendChild(highlightsCard(s));
   root.appendChild(headersCard(s.headers));
   root.appendChild(techCard(s));
   if(s.aiCorrelation) root.appendChild(aiCorrelationCard(s));
@@ -151,6 +175,11 @@ function exportCard(s){
   card.querySelector("#exportTxtBtn").addEventListener("click", ()=>{
     let report = `SnailSploit Recon Report\n${'='.repeat(50)}\n\n`;
     report += `Domain: ${s.domain||'N/A'}\nURL: ${s.url||'N/A'}\nTimestamp: ${new Date(s.ts||Date.now()).toISOString()}\n\n`;
+    if(s.highlights?.items?.length){
+      report += `Highlights:\n${'-'.repeat(30)}\n`;
+      s.highlights.items.forEach(it=>{ report += `- [${(it.severity||'').toUpperCase()}] ${it.title||''}: ${it.detail||''}\n`; });
+      report += `\n`;
+    }
     report += `Security Headers:\n${'-'.repeat(30)}\n`;
     Object.entries(s.headers||{}).forEach(([k,v])=>report+=`${k}: ${v||'missing'}\n`);
     report += `\nIP Addresses: ${(s.ips||[]).join(', ')}\n`;
