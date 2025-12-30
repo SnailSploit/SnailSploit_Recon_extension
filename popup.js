@@ -294,7 +294,234 @@ async function render(){
   root.appendChild(secretsCard(s));
   root.appendChild(subsCard(s));
   if(s.aiEnhancedSubs && s.aiEnhancedSubs.length > 0) root.appendChild(aiEnhancedSubsCard(s));
+  root.appendChild(externalToolsCard(s));
   root.appendChild(exportCard(s));
+}
+
+function externalToolsCard(s){
+  const card=el(`<div class="card"><h3>🛠️ External Tools</h3><div class="small" style="margin-bottom:12px">Quick access to complementary reconnaissance tools</div></div>`);
+
+  const tools = [
+    {
+      name: "Burp Suite Export",
+      desc: "Export subdomains to Burp Suite scope",
+      action: "burp",
+      icon: "🎯"
+    },
+    {
+      name: "Nuclei Template",
+      desc: "Generate nuclei scan targets file",
+      action: "nuclei",
+      icon: "🔬"
+    },
+    {
+      name: "Subfinder Format",
+      desc: "Export subdomains in subfinder format",
+      action: "subfinder",
+      icon: "🔍"
+    },
+    {
+      name: "Nmap Scan File",
+      desc: "Generate nmap target list",
+      action: "nmap",
+      icon: "🌐"
+    },
+    {
+      name: "HTTPX Input",
+      desc: "Export URLs for httpx scanning",
+      action: "httpx",
+      icon: "📡"
+    },
+    {
+      name: "Bookmarklet: Quick Recon",
+      desc: "Drag to bookmarks bar for instant recon",
+      action: "bookmarklet",
+      icon: "⚡"
+    }
+  ];
+
+  for(const tool of tools){
+    const row = el(`<div class="row" style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee">
+      <div>
+        <div><span style="font-size:16px;margin-right:6px">${tool.icon}</span><b>${esc(tool.name)}</b></div>
+        <div class="small">${esc(tool.desc)}</div>
+      </div>
+      <button class="btn" data-tool="${tool.action}" style="margin-left:12px;white-space:nowrap">
+        ${tool.action === 'bookmarklet' ? 'Get Code' : 'Export'}
+      </button>
+    </div>`);
+    card.appendChild(row);
+  }
+
+  // Add event listeners
+  card.querySelectorAll("button[data-tool]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tool = btn.dataset.tool;
+
+      if(tool === "burp"){
+        exportBurpScope(s);
+      } else if(tool === "nuclei"){
+        exportNuclei(s);
+      } else if(tool === "subfinder"){
+        exportSubfinder(s);
+      } else if(tool === "nmap"){
+        exportNmap(s);
+      } else if(tool === "httpx"){
+        exportHTTPX(s);
+      } else if(tool === "bookmarklet"){
+        showBookmarklet();
+      }
+    });
+  });
+
+  return card;
+}
+
+// Export functions for external tools
+function exportBurpScope(s){
+  const scope = {
+    target: {
+      scope: {
+        advanced_mode: true,
+        exclude: [],
+        include: []
+      }
+    }
+  };
+
+  // Add main domain
+  if(s.domain){
+    scope.target.scope.include.push({
+      enabled: true,
+      host: s.domain,
+      protocol: "any"
+    });
+  }
+
+  // Add subdomains
+  const subs = s.quickSubs || [];
+  subs.forEach(sub => {
+    scope.target.scope.include.push({
+      enabled: true,
+      host: sub.subdomain,
+      protocol: "any"
+    });
+  });
+
+  // Add AI-filtered subs
+  const aiSubs = s.aiEnhancedSubs || [];
+  aiSubs.forEach(sub => {
+    scope.target.scope.include.push({
+      enabled: true,
+      host: sub.subdomain,
+      protocol: "any"
+    });
+  });
+
+  downloadFile(JSON.stringify(scope, null, 2), `burp-scope-${s.domain}-${Date.now()}.json`, 'application/json');
+}
+
+function exportNuclei(s){
+  const targets = [];
+
+  if(s.url) targets.push(s.url);
+
+  const subs = s.quickSubs || [];
+  subs.forEach(sub => {
+    targets.push(`https://${sub.subdomain}`);
+    targets.push(`http://${sub.subdomain}`);
+  });
+
+  downloadFile(targets.join('\n'), `nuclei-targets-${s.domain}-${Date.now()}.txt`, 'text/plain');
+}
+
+function exportSubfinder(s){
+  const subs = [];
+
+  if(s.domain) subs.push(s.domain);
+
+  const quickSubs = s.quickSubs || [];
+  quickSubs.forEach(sub => subs.push(sub.subdomain));
+
+  const aiSubs = s.aiEnhancedSubs || [];
+  aiSubs.forEach(sub => subs.push(sub.subdomain));
+
+  // Deduplicate
+  const unique = [...new Set(subs)];
+
+  downloadFile(unique.join('\n'), `subdomains-${s.domain}-${Date.now()}.txt`, 'text/plain');
+}
+
+function exportNmap(s){
+  const targets = [];
+
+  // Add IPs
+  const ips = s.ips || [];
+  ips.forEach(ip => targets.push(ip));
+
+  // Add subdomains
+  const subs = s.quickSubs || [];
+  subs.forEach(sub => targets.push(sub.subdomain));
+
+  downloadFile(targets.join('\n'), `nmap-targets-${s.domain}-${Date.now()}.txt`, 'text/plain');
+}
+
+function exportHTTPX(s){
+  const urls = [];
+
+  if(s.url) urls.push(s.url);
+
+  const subs = s.quickSubs || [];
+  subs.forEach(sub => {
+    urls.push(`https://${sub.subdomain}`);
+    urls.push(`http://${sub.subdomain}`);
+  });
+
+  downloadFile(urls.join('\n'), `httpx-urls-${s.domain}-${Date.now()}.txt`, 'text/plain');
+}
+
+function showBookmarklet(){
+  const code = `javascript:(function(){
+    const d=document.domain;
+    chrome.runtime.sendMessage('${chrome.runtime.id}', {type:'quickRecon',domain:d}, r=>{
+      alert('SnailSploit Recon started for: '+d);
+    });
+  })();`;
+
+  const modal = el(`<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center" id="bookmarkletModal">
+    <div style="background:white;padding:24px;border-radius:8px;max-width:600px;width:90%">
+      <h3 style="margin-top:0">Quick Recon Bookmarklet</h3>
+      <p class="small">Drag this link to your bookmarks bar, or copy the code:</p>
+      <div style="background:#f5f5f5;padding:12px;border-radius:4px;margin:12px 0;word-break:break-all;font-family:monospace;font-size:11px">
+        <a href="${esc(code)}" style="color:#1976d2;text-decoration:none">⚡ SnailSploit Quick Recon</a>
+      </div>
+      <p class="small"><b>Usage:</b> Click the bookmark on any website to instantly trigger reconnaissance.</p>
+      <button class="btn" id="closeModal" style="margin-top:12px">Close</button>
+      <button class="btn" id="copyCode" style="margin-top:12px;margin-left:8px">Copy Code</button>
+    </div>
+  </div>`);
+
+  document.body.appendChild(modal);
+
+  modal.querySelector('#closeModal').addEventListener('click', () => modal.remove());
+  modal.querySelector('#copyCode').addEventListener('click', () => {
+    navigator.clipboard.writeText(code);
+    alert('Bookmarklet code copied to clipboard!');
+  });
+
+  modal.addEventListener('click', (e) => {
+    if(e.target === modal) modal.remove();
+  });
+}
+
+function downloadFile(content, filename, mimeType){
+  const blob = new Blob([content], {type: mimeType});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function exportCard(s){
