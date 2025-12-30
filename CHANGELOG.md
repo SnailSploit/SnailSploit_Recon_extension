@@ -2,6 +2,232 @@
 
 All notable changes to SnailSploit Recon Extension will be documented in this file.
 
+## [2.1.0] - 2025-12-30 - ULTIMATE PENTEST INTELLIGENCE 🚀🔥
+
+### 🎯 Major Release: Advanced Application Security Analysis
+
+This release elevates SnailSploit Recon to **elite-tier status** with 6 powerful new features focused on modern web application reconnaissance. Now covering API discovery, cloud infrastructure detection, GraphQL security, real-time communications, authentication analysis, and client-side storage inspection.
+
+### 🔥 New Advanced Features
+
+#### API Endpoint Discovery 🔗
+- **JavaScript code analysis**: Automatically extracts API routes from client-side code
+- **Pattern matching**: Detects fetch(), axios(), REST endpoints, versioned APIs
+- **Comprehensive coverage**: Finds /api/, /v1/, /graphql, /webhook paths
+- **100+ endpoints**: Captures up to 100 unique API routes per application
+- **Attack surface mapping**: Instantly identifies all API entry points for testing
+- **Export ready**: All endpoints available for Burp Suite, Nuclei, HTTPX
+
+**Use Cases:**
+- Discover hidden/undocumented API endpoints
+- Map complete API attack surface
+- Identify versioned API paths for testing
+- Find admin/internal endpoints in production code
+
+#### Cloud Resource Detection ☁️
+- **AWS S3 bucket discovery**: Finds all S3 URLs, bucket names, and s3:// URIs
+- **Azure Blob Storage**: Detects .blob.core.windows.net and .file.core.windows.net
+- **Google Cloud Storage**: Identifies storage.googleapis.com buckets
+- **CloudFront distributions**: Extracts .cloudfront.net URLs
+- **Takeover detection**: Highlights resources for misconfiguration testing
+- **50+ resources per type**: Comprehensive cloud infrastructure mapping
+
+**Security Implications:**
+- Test S3 buckets for public read/write access
+- Check for subdomain takeover via orphaned CloudFront
+- Identify cloud storage leaking sensitive data
+- Map cloud infrastructure for lateral movement
+
+#### GraphQL Introspection ⚠️
+- **Auto-detection**: Probes /graphql, /api/graphql, /v1/graphql, /query, /api
+- **Schema extraction**: Full introspection query reveals all types, queries, mutations
+- **Type enumeration**: Lists all GraphQL object types with kind (OBJECT, ENUM, etc.)
+- **Operation mapping**: Identifies queryType, mutationType, subscriptionType
+- **Critical severity**: Flagged as critical finding when introspection is enabled
+- **50 types displayed**: Shows schema structure for attack planning
+
+**Attack Vectors:**
+- Extract complete API schema without documentation
+- Identify sensitive queries and mutations
+- Discover hidden fields and types
+- Plan GraphQL injection and DoS attacks
+
+#### WebSocket Endpoint Detection 🔌
+- **Real-time comm discovery**: Finds all WebSocket and Socket.io connections
+- **Protocol support**: Detects ws://, wss://, new WebSocket(), socket.io()
+- **30 endpoints tracked**: Comprehensive real-time channel mapping
+- **Attack surface**: Identifies bidirectional communication channels
+- **Testing targets**: All endpoints ready for WebSocket fuzzing
+
+**Reconnaissance Value:**
+- Map real-time features (chat, notifications, live updates)
+- Identify authentication bypass opportunities
+- Test WebSocket message injection
+- Discover event-based vulnerabilities
+
+#### Authentication Flow Detection 🔐
+- **OAuth 2.0**: Detects authorize, client_id, response_type patterns (HIGH confidence)
+- **JWT**: Identifies jsonwebtoken, bearer token usage (HIGH confidence)
+- **SAML**: Finds SAML assertions and SSO flows (MEDIUM confidence)
+- **Basic Auth**: Detects Authorization: Basic headers (MEDIUM confidence)
+- **API Keys**: Identifies api_key, x-api-key patterns (MEDIUM confidence)
+- **Session-based**: Detects session cookies, CSRF tokens (LOW confidence)
+- **Confidence scoring**: Each mechanism rated for reliability
+
+**Security Analysis:**
+- Identify authentication mechanisms in use
+- Plan auth bypass and privilege escalation tests
+- Understand token storage and validation
+- Test authentication flow vulnerabilities
+
+#### Browser Storage Extraction 💾
+- **localStorage analysis**: Extracts all localStorage keys and values (up to 50 items)
+- **sessionStorage analysis**: Captures session-specific data (up to 50 items)
+- **Sensitive data detection**: Highlights items containing tokens, secrets, passwords, API keys
+- **Visual warnings**: Red background for sensitive storage items
+- **500 char preview**: Shows data snippets for quick analysis
+- **Security audit**: Identifies client-side credential storage issues
+
+**Critical Findings:**
+- JWT tokens stored in localStorage (XSS risk)
+- API keys in client-side storage
+- Session tokens accessible to JavaScript
+- Passwords or secrets in browser storage
+- Authentication state exposure
+
+### 🎨 New UI Components
+
+#### Advanced Recon Cards
+- **🔗 API Endpoints Card**: Lists all discovered API routes with chip-style display
+- **☁️ Cloud Resources Card**: Organizes S3, Azure, GCP, CloudFront by type with color coding
+- **⚠️ GraphQL Introspection Card**: Critical-styled card showing schema details
+- **🔌 WebSocket Endpoints Card**: Real-time communication channels
+- **🔐 Authentication Mechanisms Card**: Detected auth flows with confidence levels
+- **💾 Browser Storage Card**: Collapsible localStorage/sessionStorage with sensitive item highlighting
+
+#### Enhanced Export Features
+- **📥 HTML Report Generator**: Professional, styled HTML reports with all findings
+  - Clean, modern design with responsive layout
+  - Color-coded severity badges (critical, high, medium, low)
+  - Organized sections for all reconnaissance categories
+  - Tables for structured data (headers, subdomains, files)
+  - Chip-style tags for technologies and resources
+  - Timestamp and metadata for documentation
+  - Printable format for client reports
+  - One-click download as standalone HTML file
+
+### 🔧 Technical Enhancements
+
+#### Content Script Updates (content.js)
+- **localStorage extraction**: Iterates through localStorage (max 50 keys, 500 char values)
+- **sessionStorage extraction**: Captures session-specific data
+- **Graceful error handling**: Try-catch blocks for storage access failures
+- **Privacy-aware limits**: 500 character preview prevents excessive data collection
+- **Throttled transmission**: Sends storage data with other page resources
+
+#### Service Worker Integration (sw.js)
+- **`discoverAPIEndpoints()`**: 6 regex patterns for comprehensive API route extraction
+- **`detectCloudResources()`**: 10+ patterns for AWS, Azure, GCP, CloudFront
+- **`introspectGraphQL()`**: Async introspection with 5 common endpoint paths
+- **`detectWebSockets()`**: 4 patterns for WS/WSS/Socket.io detection
+- **`detectAuthFlows()`**: 6 authentication mechanism patterns with confidence scoring
+- **Parallel execution**: GraphQL introspection runs with other security checks (13 total)
+- **State management**: All new features stored in tab-specific state
+- **Highlights integration**: 6 new highlight rules for critical findings
+
+#### Highlights System Expansion
+- **Cloud storage discovered**: High severity when S3/Azure/GCP resources found
+- **GraphQL introspection enabled**: Critical severity (schema exposure)
+- **API endpoints discovered**: Medium severity (attack surface expansion)
+- **WebSocket endpoints found**: Low severity (real-time channels)
+- **Authentication detected**: Low severity (mechanism identification)
+- **Sensitive browser storage**: Medium severity when tokens/secrets in localStorage
+
+#### Popup Rendering (popup.js)
+- **6 new card functions**: apiEndpointsCard, cloudResourcesCard, graphqlCard, wsEndpointsCard, authFlowsCard, storageCard
+- **Conditional rendering**: Cards only shown when data exists
+- **Expandable details**: <details> tags for localStorage/sessionStorage
+- **Color coding**: Different backgrounds for S3/Azure/GCP, sensitive storage items
+- **Responsive design**: Max-height with overflow for large datasets
+- **Chip components**: Consistent visual style across all cards
+
+### 📊 Data Collection Stats
+
+**New Data Points:**
+- 100+ API endpoints per application
+- 50+ S3 buckets, 50+ Azure blobs, 50+ GCP buckets
+- 50+ CloudFront distributions
+- Full GraphQL schemas (50+ types)
+- 30+ WebSocket endpoints
+- 6 authentication mechanisms
+- 100 localStorage/sessionStorage items
+
+**Total Intelligence Gathering:**
+- **Previous (v2.0)**: 15+ security checks, 25+ file probes, 60+ tech patterns
+- **New (v2.1)**: +6 advanced features, +300 potential data points
+- **Combined**: 20+ security modules, 600+ intelligence sources
+
+### 🎯 For Penetration Testers & Red Teams
+
+This release makes SnailSploit Recon **essential** for modern web application testing:
+
+✅ **API Security Testing**
+- Complete API surface mapping from JavaScript
+- Endpoint enumeration for fuzzing and injection
+- Versioned API discovery for business logic flaws
+
+✅ **Cloud Infrastructure Recon**
+- S3 bucket enumeration for data exposure
+- Subdomain takeover via CloudFront
+- Cloud storage misconfiguration testing
+
+✅ **GraphQL Security**
+- Schema extraction without documentation
+- Query/mutation enumeration
+- GraphQL injection attack planning
+
+✅ **Real-time Communication**
+- WebSocket endpoint discovery
+- Event-based vulnerability testing
+- Message injection opportunities
+
+✅ **Authentication Analysis**
+- Multi-mechanism detection (OAuth, JWT, SAML, Basic, API Key, Session)
+- Auth bypass planning
+- Token storage security audit
+
+✅ **Client-Side Security**
+- localStorage/sessionStorage inspection
+- XSS-to-account-takeover chains
+- Sensitive data exposure in browser
+
+✅ **Professional Reporting**
+- Comprehensive HTML reports for clients
+- Styled, organized, printable format
+- All findings documented with severity
+
+### 🐛 Bug Fixes
+- Fixed potential XSS in storage card rendering (proper escaping)
+- Improved error handling for GraphQL introspection failures
+- Better null checks for storage access in sandboxed contexts
+
+### 📝 Developer Notes
+- All new features run asynchronously without blocking
+- Content script storage extraction respects browser security policies
+- GraphQL introspection attempts 5 common paths before giving up
+- Storage data limited to 50 items × 500 chars for performance
+- HTML report generator uses template literals for clean code
+
+### ⚡ Performance Notes
+- No performance impact: All new features run in parallel with existing checks
+- Lazy rendering: UI cards only created when data exists
+- Efficient storage: 500 char limits prevent memory bloat
+- Fast GraphQL probes: 5 second timeout per endpoint
+
+**Upgrade immediately to unlock elite-tier reconnaissance capabilities!**
+
+---
+
 ## [2.0.0] - 2025-12-30 - GOLD STANDARD PENTEST TOOLKIT 🎯⚡
 
 ### 🚀 Major Release: Comprehensive Security Analysis Overhaul

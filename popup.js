@@ -261,6 +261,151 @@ function aiEnhancedSubsCard(s){
   return card;
 }
 
+function apiEndpointsCard(s){
+  const card=el(`<div class="card"><h3>🔗 API Endpoints</h3><div class="small">Discovered from JavaScript code analysis</div></div>`);
+  const endpoints = s.apiEndpoints || [];
+  const list = el(`<div style="margin-top:8px;max-height:200px;overflow-y:auto"></div>`);
+  endpoints.slice(0, 50).forEach(endpoint => {
+    list.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#e3f2fd;border-radius:4px;font-family:monospace;font-size:11px">${esc(endpoint)}</div>`));
+  });
+  card.appendChild(list);
+  if(endpoints.length > 50) card.appendChild(el(`<div class="small" style="margin-top:8px;color:#666">+ ${endpoints.length - 50} more endpoints</div>`));
+  return card;
+}
+
+function cloudResourcesCard(s){
+  const card=el(`<div class="card"><h3>☁️ Cloud Resources</h3><div class="small">Cloud storage and CDN resources detected</div></div>`);
+  const { s3 = [], azure = [], gcp = [], cloudfront = [] } = s.cloudResources || {};
+
+  if(s3.length > 0) {
+    card.appendChild(el(`<div style="margin-top:12px"><strong>AWS S3 Buckets (${s3.length}):</strong></div>`));
+    const s3List = el(`<div style="margin-top:4px;max-height:150px;overflow-y:auto"></div>`);
+    s3.slice(0, 20).forEach(bucket => {
+      s3List.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#fff3e0;border-radius:4px;font-family:monospace;font-size:11px">${esc(bucket)}</div>`));
+    });
+    card.appendChild(s3List);
+  }
+
+  if(azure.length > 0) {
+    card.appendChild(el(`<div style="margin-top:12px"><strong>Azure Blob Storage (${azure.length}):</strong></div>`));
+    const azureList = el(`<div style="margin-top:4px;max-height:150px;overflow-y:auto"></div>`);
+    azure.slice(0, 20).forEach(blob => {
+      azureList.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#e1f5fe;border-radius:4px;font-family:monospace;font-size:11px">${esc(blob)}</div>`));
+    });
+    card.appendChild(azureList);
+  }
+
+  if(gcp.length > 0) {
+    card.appendChild(el(`<div style="margin-top:12px"><strong>GCP Buckets (${gcp.length}):</strong></div>`));
+    const gcpList = el(`<div style="margin-top:4px;max-height:150px;overflow-y:auto"></div>`);
+    gcp.slice(0, 20).forEach(bucket => {
+      gcpList.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#f3e5f5;border-radius:4px;font-family:monospace;font-size:11px">${esc(bucket)}</div>`));
+    });
+    card.appendChild(gcpList);
+  }
+
+  if(cloudfront.length > 0) {
+    card.appendChild(el(`<div style="margin-top:12px"><strong>CloudFront Distributions (${cloudfront.length}):</strong></div>`));
+    const cfList = el(`<div style="margin-top:4px;max-height:150px;overflow-y:auto"></div>`);
+    cloudfront.slice(0, 20).forEach(dist => {
+      cfList.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#fce4ec;border-radius:4px;font-family:monospace;font-size:11px">${esc(dist)}</div>`));
+    });
+    card.appendChild(cfList);
+  }
+
+  return card;
+}
+
+function graphqlCard(s){
+  const schema = s.graphqlSchema;
+  const card=el(`<div class="card" style="border-left:4px solid #f44336"><h3>⚠️ GraphQL Introspection Enabled</h3><div class="small" style="color:#d32f2f">Critical: Schema exposed at ${esc(schema.endpoint)}</div></div>`);
+
+  card.appendChild(el(`<div style="margin-top:12px"><strong>Schema Types:</strong> ${schema.types ? schema.types.length : 0}</div>`));
+  if(schema.queryType) card.appendChild(el(`<div><strong>Query Type:</strong> ${esc(schema.queryType)}</div>`));
+  if(schema.mutationType) card.appendChild(el(`<div><strong>Mutation Type:</strong> ${esc(schema.mutationType)}</div>`));
+  if(schema.subscriptionType) card.appendChild(el(`<div><strong>Subscription Type:</strong> ${esc(schema.subscriptionType)}</div>`));
+
+  if(schema.types && schema.types.length > 0) {
+    const details = el(`<details style="margin-top:12px"><summary style="cursor:pointer;color:#1976d2">View Schema Types</summary></details>`);
+    const typeList = el(`<div style="margin-top:8px;max-height:200px;overflow-y:auto"></div>`);
+    schema.types.slice(0, 30).forEach(type => {
+      typeList.appendChild(el(`<div style="padding:4px;font-family:monospace;font-size:11px">${esc(type.name)} <span style="color:#666">(${esc(type.kind)})</span></div>`));
+    });
+    details.appendChild(typeList);
+    card.appendChild(details);
+  }
+
+  return card;
+}
+
+function wsEndpointsCard(s){
+  const card=el(`<div class="card"><h3>🔌 WebSocket Endpoints</h3><div class="small">Real-time communication endpoints discovered</div></div>`);
+  const endpoints = s.wsEndpoints || [];
+  const list = el(`<div style="margin-top:8px;max-height:200px;overflow-y:auto"></div>`);
+  endpoints.slice(0, 30).forEach(endpoint => {
+    list.appendChild(el(`<div class="chip" style="margin:4px;padding:4px 8px;background:#e8f5e9;border-radius:4px;font-family:monospace;font-size:11px">${esc(endpoint)}</div>`));
+  });
+  card.appendChild(list);
+  return card;
+}
+
+function authFlowsCard(s){
+  const card=el(`<div class="card"><h3>🔐 Authentication Mechanisms</h3><div class="small">Detected authentication flows and methods</div></div>`);
+  const flows = s.authFlows || [];
+  const list = el(`<div style="margin-top:8px"></div>`);
+  flows.forEach(flow => {
+    const confidenceColor = flow.confidence === 'high' ? '#4caf50' : flow.confidence === 'medium' ? '#ff9800' : '#9e9e9e';
+    list.appendChild(el(`<div style="margin:8px 0;padding:8px;background:#f5f5f5;border-radius:4px">
+      <div><strong>${esc(flow.type)}</strong></div>
+      <div class="small" style="color:${confidenceColor}">Confidence: ${esc(flow.confidence)}</div>
+    </div>`));
+  });
+  card.appendChild(list);
+  return card;
+}
+
+function storageCard(s){
+  const storage = s.storage || {};
+  const localItems = Object.entries(storage.localStorage || {});
+  const sessionItems = Object.entries(storage.sessionStorage || {});
+
+  const card=el(`<div class="card"><h3>💾 Browser Storage</h3><div class="small">localStorage (${localItems.length}) & sessionStorage (${sessionItems.length})</div></div>`);
+
+  if(localItems.length > 0) {
+    const details = el(`<details style="margin-top:12px"><summary style="cursor:pointer;color:#1976d2">localStorage Items (${localItems.length})</summary></details>`);
+    const itemList = el(`<div style="margin-top:8px;max-height:200px;overflow-y:auto"></div>`);
+    localItems.slice(0, 20).forEach(([key, value]) => {
+      const hasSensitive = /token|secret|password|api[_-]?key|bearer|auth|jwt|session/i.test(key + value);
+      const bgColor = hasSensitive ? '#ffebee' : '#f5f5f5';
+      const preview = String(value).slice(0, 100);
+      itemList.appendChild(el(`<div style="margin:8px 0;padding:8px;background:${bgColor};border-radius:4px">
+        <div style="font-family:monospace;font-size:11px;font-weight:bold">${esc(key)}</div>
+        <div style="font-family:monospace;font-size:10px;color:#666;margin-top:4px">${esc(preview)}${value.length > 100 ? '...' : ''}</div>
+      </div>`));
+    });
+    details.appendChild(itemList);
+    card.appendChild(details);
+  }
+
+  if(sessionItems.length > 0) {
+    const details = el(`<details style="margin-top:12px"><summary style="cursor:pointer;color:#1976d2">sessionStorage Items (${sessionItems.length})</summary></details>`);
+    const itemList = el(`<div style="margin-top:8px;max-height:200px;overflow-y:auto"></div>`);
+    sessionItems.slice(0, 20).forEach(([key, value]) => {
+      const hasSensitive = /token|secret|password|api[_-]?key|bearer|auth|jwt|session/i.test(key + value);
+      const bgColor = hasSensitive ? '#ffebee' : '#f5f5f5';
+      const preview = String(value).slice(0, 100);
+      itemList.appendChild(el(`<div style="margin:8px 0;padding:8px;background:${bgColor};border-radius:4px">
+        <div style="font-family:monospace;font-size:11px;font-weight:bold">${esc(key)}</div>
+        <div style="font-family:monospace;font-size:10px;color:#666;margin-top:4px">${esc(preview)}${value.length > 100 ? '...' : ''}</div>
+      </div>`));
+    });
+    details.appendChild(itemList);
+    card.appendChild(details);
+  }
+
+  return card;
+}
+
 async function render(){
   const root=document.getElementById("root"); const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
   if(!s){ root.textContent="No data yet. Reload the page."; return; } if(s.error){ root.textContent=`Error: ${s.error}`; return; }
@@ -275,6 +420,16 @@ async function render(){
   }
 
   root.appendChild(techCard(s));
+
+  // Advanced reconnaissance features
+  if(s.apiEndpoints && s.apiEndpoints.length > 0) root.appendChild(apiEndpointsCard(s));
+  if(s.cloudResources) root.appendChild(cloudResourcesCard(s));
+  if(s.graphqlSchema) root.appendChild(graphqlCard(s));
+  if(s.wsEndpoints && s.wsEndpoints.length > 0) root.appendChild(wsEndpointsCard(s));
+  if(s.authFlows && s.authFlows.length > 0) root.appendChild(authFlowsCard(s));
+  if(s.storage && (Object.keys(s.storage.localStorage || {}).length > 0 || Object.keys(s.storage.sessionStorage || {}).length > 0)) {
+    root.appendChild(storageCard(s));
+  }
 
   // Intelligence gathering
   if(s.intel && (s.intel.emails?.length || s.intel.phones?.length || s.intel.socialLinks?.length || s.intel.comments?.length)) {
@@ -525,17 +680,15 @@ function downloadFile(content, filename, mimeType){
 }
 
 function exportCard(s){
-  const card=el(`<div class="card"><h3>Export</h3><button class="btn" id="exportBtn">Export Results as JSON</button> <button class="btn" id="exportTxtBtn">Export as Text Report</button></div>`);
+  const card=el(`<div class="card"><h3>📥 Export</h3><button class="btn" id="exportBtn">JSON</button> <button class="btn" id="exportTxtBtn">Text</button> <button class="btn" id="exportHtmlBtn">HTML Report</button></div>`);
+
+  // JSON Export
   card.querySelector("#exportBtn").addEventListener("click", ()=>{
     const dataStr = JSON.stringify(s, null, 2);
-    const blob = new Blob([dataStr], {type: 'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `recon-${s.domain||'report'}-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadFile(dataStr, `recon-${s.domain||'report'}-${Date.now()}.json`, 'application/json');
   });
+
+  // Text Export
   card.querySelector("#exportTxtBtn").addEventListener("click", ()=>{
     let report = `SnailSploit Recon Report\n${'='.repeat(50)}\n\n`;
     report += `Domain: ${s.domain||'N/A'}\nURL: ${s.url||'N/A'}\nTimestamp: ${new Date(s.ts||Date.now()).toISOString()}\n\n`;
@@ -549,15 +702,240 @@ function exportCard(s){
     report += `\nIP Addresses: ${(s.ips||[]).join(', ')}\n`;
     if(s.quickSubs?.length) report += `\nSubdomains (${s.quickSubs.length}):\n${s.quickSubs.map(x=>x.subdomain).join('\n')}\n`;
     if(s.secrets?.length) report += `\nSecrets Found: ${s.secrets.length} sources\n`;
-    const blob = new Blob([report], {type: 'text/plain'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `recon-${s.domain||'report'}-${Date.now()}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadFile(report, `recon-${s.domain||'report'}-${Date.now()}.txt`, 'text/plain');
   });
+
+  // HTML Export
+  card.querySelector("#exportHtmlBtn").addEventListener("click", ()=>{
+    const html = generateHTMLReport(s);
+    downloadFile(html, `recon-${s.domain||'report'}-${Date.now()}.html`, 'text/html');
+  });
+
   return card;
+}
+
+function generateHTMLReport(s){
+  const timestamp = new Date(s.ts || Date.now()).toISOString();
+  const domain = esc(s.domain || 'Unknown');
+  const url = esc(s.url || 'Unknown');
+
+  let html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SnailSploit Recon Report - ${domain}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    h1 { color: #1976d2; margin-bottom: 10px; }
+    h2 { color: #333; margin: 30px 0 15px; border-bottom: 2px solid #1976d2; padding-bottom: 8px; }
+    h3 { color: #555; margin: 20px 0 10px; }
+    .meta { color: #666; margin-bottom: 30px; }
+    .highlight { padding: 12px; margin: 8px 0; border-radius: 4px; border-left: 4px solid; }
+    .highlight.critical { background: #ffebee; border-color: #f44336; }
+    .highlight.high { background: #fff3e0; border-color: #ff9800; }
+    .highlight.medium { background: #fff9c4; border-color: #fbc02d; }
+    .highlight.low { background: #f5f5f5; border-color: #9e9e9e; }
+    .chip { display: inline-block; padding: 4px 12px; margin: 4px; background: #e3f2fd; border-radius: 16px; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 15px 0; }
+    .card { background: #fafafa; padding: 15px; border-radius: 6px; border: 1px solid #e0e0e0; }
+    table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    th, td { padding: 10px; text-align: left; border-bottom: 1px solid #e0e0e0; }
+    th { background: #f5f5f5; font-weight: 600; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 13px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge.critical { background: #f44336; color: white; }
+    .badge.high { background: #ff9800; color: white; }
+    .badge.medium { background: #fbc02d; color: #333; }
+    .badge.low { background: #9e9e9e; color: white; }
+    ul { margin: 10px 0 10px 20px; }
+    li { margin: 5px 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🐌 SnailSploit Recon Report</h1>
+    <div class="meta">
+      <strong>Domain:</strong> ${domain}<br>
+      <strong>URL:</strong> ${url}<br>
+      <strong>Timestamp:</strong> ${timestamp}
+    </div>
+`;
+
+  // Highlights
+  if(s.highlights?.items?.length){
+    html += `<h2>⚡ Key Findings</h2>`;
+    s.highlights.items.forEach(h => {
+      const severity = (h.severity || 'low').toLowerCase();
+      html += `<div class="highlight ${severity}">
+        <strong>${esc(h.title || '')}</strong>
+        <div style="margin-top:4px;font-size:14px;color:#666">${esc(h.detail || '')}</div>
+      </div>`;
+    });
+  }
+
+  // Security Headers
+  html += `<h2>🔒 Security Headers</h2><table><thead><tr><th>Header</th><th>Value</th></tr></thead><tbody>`;
+  const headers = s.headers || {};
+  Object.entries(headers).forEach(([k,v]) => {
+    html += `<tr><td><code>${esc(k)}</code></td><td>${esc(v || 'missing')}</td></tr>`;
+  });
+  html += `</tbody></table>`;
+
+  // TLS Certificate
+  if(s.tlsInfo){
+    html += `<h2>🔐 TLS Certificate</h2><div class="grid">`;
+    html += `<div class="card"><strong>Issuer:</strong><br>${esc(s.tlsInfo.issuer || 'N/A')}</div>`;
+    html += `<div class="card"><strong>Common Name:</strong><br>${esc(s.tlsInfo.commonName || 'N/A')}</div>`;
+    html += `<div class="card"><strong>Expires:</strong><br>${esc(s.tlsInfo.notAfter || 'N/A')}</div>`;
+    html += `</div>`;
+    if(s.tlsInfo.sans?.length) {
+      html += `<h3>Subject Alternative Names (${s.tlsInfo.sans.length})</h3><div>`;
+      s.tlsInfo.sans.slice(0, 50).forEach(san => html += `<span class="chip">${esc(san)}</span>`);
+      html += `</div>`;
+    }
+  }
+
+  // API Endpoints
+  if(s.apiEndpoints?.length){
+    html += `<h2>🔗 API Endpoints (${s.apiEndpoints.length})</h2><div>`;
+    s.apiEndpoints.slice(0, 100).forEach(ep => html += `<span class="chip">${esc(ep)}</span>`);
+    html += `</div>`;
+  }
+
+  // Cloud Resources
+  if(s.cloudResources){
+    const { s3 = [], azure = [], gcp = [], cloudfront = [] } = s.cloudResources;
+    if(s3.length || azure.length || gcp.length || cloudfront.length){
+      html += `<h2>☁️ Cloud Resources</h2>`;
+      if(s3.length) {
+        html += `<h3>AWS S3 Buckets (${s3.length})</h3><div>`;
+        s3.slice(0, 50).forEach(b => html += `<span class="chip">${esc(b)}</span>`);
+        html += `</div>`;
+      }
+      if(azure.length) {
+        html += `<h3>Azure Blob Storage (${azure.length})</h3><div>`;
+        azure.slice(0, 50).forEach(b => html += `<span class="chip">${esc(b)}</span>`);
+        html += `</div>`;
+      }
+      if(gcp.length) {
+        html += `<h3>GCP Buckets (${gcp.length})</h3><div>`;
+        gcp.slice(0, 50).forEach(b => html += `<span class="chip">${esc(b)}</span>`);
+        html += `</div>`;
+      }
+    }
+  }
+
+  // GraphQL
+  if(s.graphqlSchema){
+    html += `<h2>⚠️ GraphQL Introspection</h2>`;
+    html += `<div class="card" style="background:#ffebee">`;
+    html += `<strong>Endpoint:</strong> ${esc(s.graphqlSchema.endpoint || 'N/A')}<br>`;
+    html += `<strong>Schema Types:</strong> ${s.graphqlSchema.types?.length || 0}<br>`;
+    if(s.graphqlSchema.queryType) html += `<strong>Query Type:</strong> ${esc(s.graphqlSchema.queryType)}<br>`;
+    if(s.graphqlSchema.mutationType) html += `<strong>Mutation Type:</strong> ${esc(s.graphqlSchema.mutationType)}<br>`;
+    html += `</div>`;
+  }
+
+  // WebSocket Endpoints
+  if(s.wsEndpoints?.length){
+    html += `<h2>🔌 WebSocket Endpoints (${s.wsEndpoints.length})</h2><div>`;
+    s.wsEndpoints.forEach(ws => html += `<span class="chip">${esc(ws)}</span>`);
+    html += `</div>`;
+  }
+
+  // Auth Flows
+  if(s.authFlows?.length){
+    html += `<h2>🔐 Authentication Mechanisms</h2><ul>`;
+    s.authFlows.forEach(f => html += `<li><strong>${esc(f.type)}</strong> <span class="badge ${f.confidence}">${esc(f.confidence)}</span></li>`);
+    html += `</ul>`;
+  }
+
+  // Browser Storage
+  if(s.storage){
+    const localItems = Object.entries(s.storage.localStorage || {});
+    const sessionItems = Object.entries(s.storage.sessionStorage || {});
+    if(localItems.length || sessionItems.length){
+      html += `<h2>💾 Browser Storage</h2>`;
+      html += `<div class="card">localStorage: ${localItems.length} items | sessionStorage: ${sessionItems.length} items</div>`;
+    }
+  }
+
+  // CORS Findings
+  if(s.corsFindings?.length){
+    html += `<h2>⚠️ CORS Misconfigurations</h2><ul>`;
+    s.corsFindings.forEach(f => {
+      html += `<li><strong>${esc(f.type)}</strong>: ${esc(f.detail || '')}`;
+      if(f.credentials) html += ` <span class="badge critical">CREDENTIALS EXPOSED</span>`;
+      html += `</li>`;
+    });
+    html += `</ul>`;
+  }
+
+  // Sensitive Files
+  if(s.sensitiveFiles?.length){
+    html += `<h2>📁 Sensitive Files (${s.sensitiveFiles.length})</h2><table><thead><tr><th>Path</th><th>Status</th><th>Size</th></tr></thead><tbody>`;
+    s.sensitiveFiles.forEach(f => {
+      html += `<tr><td><code>${esc(f.path)}</code></td><td>${f.status || 'N/A'}</td><td>${f.size || 'N/A'}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+  }
+
+  // Intelligence
+  if(s.intel){
+    if(s.intel.emails?.length){
+      html += `<h2>📧 Email Addresses (${s.intel.emails.length})</h2><div>`;
+      s.intel.emails.slice(0, 50).forEach(e => html += `<span class="chip">${esc(e)}</span>`);
+      html += `</div>`;
+    }
+    if(s.intel.socialLinks?.length){
+      html += `<h2>🔗 Social Media (${s.intel.socialLinks.length})</h2><div>`;
+      s.intel.socialLinks.slice(0, 20).forEach(l => html += `<span class="chip">${esc(l)}</span>`);
+      html += `</div>`;
+    }
+  }
+
+  // IP Addresses
+  if(s.ips?.length){
+    html += `<h2>🌐 IP Addresses (${s.ips.length})</h2><div>`;
+    s.ips.forEach(ip => html += `<span class="chip">${esc(ip)}</span>`);
+    html += `</div>`;
+  }
+
+  // Subdomains
+  if(s.quickSubs?.length){
+    html += `<h2>🔍 Subdomains (${s.quickSubs.length})</h2><table><thead><tr><th>Subdomain</th><th>IP</th></tr></thead><tbody>`;
+    s.quickSubs.slice(0, 100).forEach(sub => {
+      html += `<tr><td><code>${esc(sub.subdomain || '')}</code></td><td>${esc(sub.ip || 'N/A')}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+  }
+
+  // Technology Stack
+  if(s.tech?.tags?.length){
+    html += `<h2>🔧 Technology Stack</h2><div>`;
+    s.tech.tags.forEach(tag => html += `<span class="chip">${esc(tag)}</span>`);
+    html += `</div>`;
+  }
+
+  // WAF Detection
+  if(s.waf?.length){
+    html += `<h2>🛡️ WAF Detected</h2><div>`;
+    s.waf.forEach(w => html += `<span class="chip" style="background:#ffebee">${esc(w)}</span>`);
+    html += `</div>`;
+  }
+
+  html += `
+    <div style="margin-top:40px;padding-top:20px;border-top:2px solid #e0e0e0;text-align:center;color:#666;font-size:12px">
+      Generated by SnailSploit Recon Extension v2.0.0 | ${timestamp}
+    </div>
+  </div>
+</body>
+</html>`;
+
+  return html;
 }
 
 (async()=>{

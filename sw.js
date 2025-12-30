@@ -754,6 +754,229 @@ function detectJSLibraries(html, scripts) {
   return libraries.length > 0 ? libraries : null;
 }
 
+// API Endpoint Discovery - Extract API routes from JavaScript code
+function discoverAPIEndpoints(scripts, html) {
+  const endpoints = new Set();
+  const allCode = (scripts || []).join('\n') + '\n' + (html || '');
+
+  // REST API patterns
+  const apiPatterns = [
+    // fetch/axios calls
+    /(?:fetch|axios|http(?:Client)?\.(?:get|post|put|delete|patch))\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    // API route definitions
+    /(?:path|route|endpoint|url)[\s:=]+["'`]([\/][^"'`\s]+)["'`]/gi,
+    // Template literals with API paths
+    /["'`](\/api\/[^"'`\s]+)["'`]/gi,
+    /["'`](\/v\d+\/[^"'`\s]+)["'`]/gi,
+    // GraphQL endpoints
+    /["'`](\/graphql[^"'`\s]*)["'`]/gi,
+    // Common API patterns
+    /["'`](\/(?:api|v\d+|rest|graphql|webhook)\/[^"'`\s]+)["'`]/gi
+  ];
+
+  for (const pattern of apiPatterns) {
+    let match;
+    while ((match = pattern.exec(allCode)) !== null) {
+      const endpoint = match[1];
+      if (endpoint && endpoint.startsWith('/') && endpoint.length > 3) {
+        // Filter out common false positives
+        if (!endpoint.includes('.js') && !endpoint.includes('.css') && !endpoint.includes('.png')) {
+          endpoints.add(endpoint);
+        }
+      }
+    }
+  }
+
+  return endpoints.size > 0 ? Array.from(endpoints).slice(0, 100) : null;
+}
+
+// Cloud Resource Detection - Find AWS S3, Azure, GCP resources
+function detectCloudResources(html, scripts) {
+  const resources = {
+    s3: new Set(),
+    azure: new Set(),
+    gcp: new Set(),
+    cloudfront: new Set()
+  };
+
+  const allContent = (html || '') + ' ' + (scripts || []).join(' ');
+
+  // AWS S3 bucket patterns
+  const s3Patterns = [
+    /https?:\/\/([a-z0-9\-\.]+)\.s3(?:[\-\.](?:[a-z0-9\-]+))?\.amazonaws\.com/gi,
+    /https?:\/\/s3(?:[\-\.](?:[a-z0-9\-]+))?\.amazonaws\.com\/([a-z0-9\-\.]+)/gi,
+    /["'`]s3:\/\/([a-z0-9\-\.]+)/gi
+  ];
+
+  // Azure Blob Storage patterns
+  const azurePatterns = [
+    /https?:\/\/([a-z0-9]+)\.blob\.core\.windows\.net/gi,
+    /https?:\/\/([a-z0-9]+)\.file\.core\.windows\.net/gi
+  ];
+
+  // Google Cloud Storage patterns
+  const gcpPatterns = [
+    /https?:\/\/storage\.googleapis\.com\/([a-z0-9\-\.\_]+)/gi,
+    /https?:\/\/([a-z0-9\-\.]+)\.storage\.googleapis\.com/gi,
+    /gs:\/\/([a-z0-9\-\.\_]+)/gi
+  ];
+
+  // CloudFront distributions
+  const cloudfrontPatterns = [
+    /https?:\/\/([a-z0-9]+)\.cloudfront\.net/gi
+  ];
+
+  // Extract S3 buckets
+  for (const pattern of s3Patterns) {
+    let match;
+    while ((match = pattern.exec(allContent)) !== null) {
+      if (match[1]) resources.s3.add(match[1]);
+    }
+  }
+
+  // Extract Azure resources
+  for (const pattern of azurePatterns) {
+    let match;
+    while ((match = pattern.exec(allContent)) !== null) {
+      if (match[1]) resources.azure.add(match[1]);
+    }
+  }
+
+  // Extract GCP buckets
+  for (const pattern of gcpPatterns) {
+    let match;
+    while ((match = pattern.exec(allContent)) !== null) {
+      if (match[1]) resources.gcp.add(match[1]);
+    }
+  }
+
+  // Extract CloudFront
+  for (const pattern of cloudfrontPatterns) {
+    let match;
+    while ((match = pattern.exec(allContent)) !== null) {
+      if (match[1]) resources.cloudfront.add(match[1]);
+    }
+  }
+
+  const result = {
+    s3: Array.from(resources.s3).slice(0, 50),
+    azure: Array.from(resources.azure).slice(0, 50),
+    gcp: Array.from(resources.gcp).slice(0, 50),
+    cloudfront: Array.from(resources.cloudfront).slice(0, 50)
+  };
+
+  const hasAny = result.s3.length > 0 || result.azure.length > 0 || result.gcp.length > 0 || result.cloudfront.length > 0;
+  return hasAny ? result : null;
+}
+
+// GraphQL Introspection - Detect and introspect GraphQL endpoints
+async function introspectGraphQL(origin) {
+  const graphqlPaths = ['/graphql', '/api/graphql', '/v1/graphql', '/query', '/api'];
+
+  for (const path of graphqlPaths) {
+    try {
+      const url = new URL(path, origin).href;
+      const introspectionQuery = {
+        query: `{
+          __schema {
+            types {
+              name
+              kind
+              description
+            }
+            queryType { name }
+            mutationType { name }
+            subscriptionType { name }
+          }
+        }`
+      };
+
+      const r = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(introspectionQuery)
+      }, 5000);
+
+      if (r.ok) {
+        const data = await r.json();
+        if (data.data && data.data.__schema) {
+          const schema = data.data.__schema;
+          return {
+            endpoint: path,
+            queryType: schema.queryType?.name,
+            mutationType: schema.mutationType?.name,
+            subscriptionType: schema.subscriptionType?.name,
+            types: (schema.types || []).slice(0, 50).map(t => ({ name: t.name, kind: t.kind }))
+          };
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+// WebSocket Detection - Find WebSocket endpoints
+function detectWebSockets(scripts, html) {
+  const wsEndpoints = new Set();
+  const allContent = (scripts || []).join('\n') + '\n' + (html || '');
+
+  // WebSocket patterns
+  const wsPatterns = [
+    /new\s+WebSocket\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    /ws:\/\/([^"'`\s]+)/gi,
+    /wss:\/\/([^"'`\s]+)/gi,
+    /socket\.io\s*\(\s*["'`]([^"'`]+)["'`]/gi
+  ];
+
+  for (const pattern of wsPatterns) {
+    let match;
+    while ((match = pattern.exec(allContent)) !== null) {
+      if (match[1]) wsEndpoints.add(match[1]);
+    }
+  }
+
+  return wsEndpoints.size > 0 ? Array.from(wsEndpoints).slice(0, 30) : null;
+}
+
+// Authentication Flow Detection - Identify auth mechanisms
+function detectAuthFlows(html, scripts) {
+  const allContent = (html || '') + ' ' + (scripts || []).join(' ');
+  const flows = [];
+
+  // OAuth patterns
+  if (/oauth|authorize|client_id|response_type/i.test(allContent)) {
+    flows.push({ type: 'OAuth 2.0', confidence: 'high' });
+  }
+
+  // JWT patterns
+  if (/jwt|jsonwebtoken|bearer.*token/i.test(allContent)) {
+    flows.push({ type: 'JWT (JSON Web Token)', confidence: 'high' });
+  }
+
+  // SAML patterns
+  if (/saml|assertion|sso.*xml/i.test(allContent)) {
+    flows.push({ type: 'SAML', confidence: 'medium' });
+  }
+
+  // Basic Auth
+  if (/authorization:\s*basic|btoa.*username.*password/i.test(allContent)) {
+    flows.push({ type: 'Basic Auth', confidence: 'medium' });
+  }
+
+  // API Key patterns
+  if (/api[_-]?key|x-api-key|apikey/i.test(allContent)) {
+    flows.push({ type: 'API Key', confidence: 'medium' });
+  }
+
+  // Session-based
+  if (/session|csrf.*token|xsrf/i.test(allContent)) {
+    flows.push({ type: 'Session-based', confidence: 'low' });
+  }
+
+  return flows.length > 0 ? flows : null;
+}
+
 // Secrets scanner - Comprehensive patterns for exposed credentials, API keys, and sensitive data
 // Over 40 patterns covering major cloud providers, SaaS platforms, and crypto
 const SECRET_PATTERNS=[
@@ -1312,6 +1535,49 @@ function deriveHighlights(state){
 
   if(!state.securityTxt) items.push({ severity:"low", title:"security.txt not found", detail:"No disclosure policy located" });
 
+  // Cloud Resources
+  if(state.cloudResources) {
+    const s3 = state.cloudResources.s3 || [];
+    const azure = state.cloudResources.azure || [];
+    const gcp = state.cloudResources.gcp || [];
+    const totalCloud = s3.length + azure.length + gcp.length;
+    if(totalCloud > 0) items.push({ severity:"high", title:"Cloud storage discovered", detail:`${s3.length} S3, ${azure.length} Azure, ${gcp.length} GCP (check for misconfigurations)` });
+  }
+
+  // GraphQL Introspection
+  if(state.graphqlSchema) {
+    const typeCount = state.graphqlSchema.types ? state.graphqlSchema.types.length : 0;
+    items.push({ severity:"critical", title:"GraphQL introspection enabled", detail:`${typeCount} types exposed at ${state.graphqlSchema.endpoint}` });
+  }
+
+  // API Endpoints
+  if(state.apiEndpoints && state.apiEndpoints.length > 0) {
+    items.push({ severity:"medium", title:"API endpoints discovered", detail:`${state.apiEndpoints.length} routes found in JavaScript` });
+  }
+
+  // WebSocket Endpoints
+  if(state.wsEndpoints && state.wsEndpoints.length > 0) {
+    items.push({ severity:"low", title:"WebSocket endpoints found", detail:`${state.wsEndpoints.length} WS/WSS connections` });
+  }
+
+  // Auth Flows
+  if(state.authFlows && state.authFlows.length > 0) {
+    const authTypes = state.authFlows.map(f => f.type).join(", ");
+    items.push({ severity:"low", title:"Authentication detected", detail:authTypes });
+  }
+
+  // localStorage/sessionStorage
+  if(state.storage) {
+    const localCount = Object.keys(state.storage.localStorage || {}).length;
+    const sessionCount = Object.keys(state.storage.sessionStorage || {}).length;
+    if(localCount > 0 || sessionCount > 0) {
+      const storageData = JSON.stringify(state.storage);
+      // Check for sensitive patterns in storage
+      const hasSensitive = /token|secret|password|api[_-]?key|bearer|auth|jwt|session/i.test(storageData);
+      if(hasSensitive) items.push({ severity:"medium", title:"Sensitive data in browser storage", detail:`${localCount} localStorage, ${sessionCount} sessionStorage items` });
+    }
+  }
+
   return { items: items.slice(0, 12) };
 }
 
@@ -1352,11 +1618,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               const waf = detectWAF(base.headers || {}, msg.htmlSample);
               const jsLibs = detectJSLibraries(msg.htmlSample, msg.externalScripts || []);
 
+              // Advanced recon features
+              const apiEndpoints = discoverAPIEndpoints(msg.externalScripts || [], msg.htmlSample);
+              const cloudResources = detectCloudResources(msg.htmlSample, msg.externalScripts || []);
+              const wsEndpoints = detectWebSockets(msg.externalScripts || [], msg.htmlSample);
+              const authFlows = detectAuthFlows(msg.htmlSample, msg.externalScripts || []);
+
               await patchState(sender.tab.id, {
                 intel,
                 forms,
                 waf,
-                jsLibraries: jsLibs
+                jsLibraries: jsLibs,
+                apiEndpoints,
+                cloudResources,
+                wsEndpoints,
+                authFlows,
+                storage: msg.storage || null
               });
               scheduleHighlights(sender.tab.id);
             } catch (e) {
@@ -1519,7 +1796,7 @@ async function analyze(tabId, url){
 
     // Domain posture and security checks (now includes TLS cert, CORS, HTTP methods, cookies)
     (async () => {
-      const [domainRDAP, robots, secTxt, dmarc, spf, dkim, mx, tlsInfo, corsCheck, httpMethods, sensitiveFiles, cookieAnalysis] = await Promise.allSettled([
+      const [domainRDAP, robots, secTxt, dmarc, spf, dkim, mx, tlsInfo, corsCheck, httpMethods, sensitiveFiles, cookieAnalysis, graphqlSchema] = await Promise.allSettled([
         rdapDomain(domain),
         getRobots(u.origin),
         getSecurityTxt(u.origin),
@@ -1531,7 +1808,8 @@ async function analyze(tabId, url){
         checkCORS(url),
         probeHTTPMethods(url),
         probeSensitiveFiles(u.origin),
-        analyzeCookies(hdrSnap?.headers || {})
+        analyzeCookies(hdrSnap?.headers || {}),
+        introspectGraphQL(u.origin)
       ]);
 
       await patchState(tabId, {
@@ -1546,7 +1824,8 @@ async function analyze(tabId, url){
         corsFindings: corsCheck.value || null,
         httpMethods: httpMethods.value || null,
         sensitiveFiles: sensitiveFiles.value || null,
-        cookieSecurity: cookieAnalysis.value || null
+        cookieSecurity: cookieAnalysis.value || null,
+        graphqlSchema: graphqlSchema.value || null
       });
       scheduleHighlights(tabId);
     })();

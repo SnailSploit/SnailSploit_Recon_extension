@@ -3,7 +3,7 @@
 // Runs on every page to collect: scripts, meta tags, favicon, HTML samples, and resource paths
 (function(){
   const abs = (u) => { try { return new URL(u, location.href).href; } catch { return null; } };
-  const state = { external: new Set(), inline: [], favicon: null, meta: {}, domHints: { paths: [] }, htmlSample: null, lastSent: 0 };
+  const state = { external: new Set(), inline: [], favicon: null, meta: {}, domHints: { paths: [] }, htmlSample: null, storage: null, lastSent: 0 };
 
   // Capture current page state: scripts, meta tags, links, favicon, and HTML sample
   function snapshot(){
@@ -33,6 +33,23 @@
       if (!state.htmlSample && document.documentElement) {
         state.htmlSample = document.documentElement.outerHTML.slice(0, 100000); // 100KB limit
       }
+      // Extract localStorage and sessionStorage for security analysis
+      if (!state.storage) {
+        const storage = { localStorage: {}, sessionStorage: {} };
+        try {
+          for (let i = 0; i < localStorage.length && i < 50; i++) {
+            const key = localStorage.key(i);
+            if (key) storage.localStorage[key] = String(localStorage.getItem(key)).slice(0, 500);
+          }
+        } catch {}
+        try {
+          for (let i = 0; i < sessionStorage.length && i < 50; i++) {
+            const key = sessionStorage.key(i);
+            if (key) storage.sessionStorage[key] = String(sessionStorage.getItem(key)).slice(0, 500);
+          }
+        } catch {}
+        state.storage = storage;
+      }
     } catch {}
   }
 
@@ -49,7 +66,8 @@
       favicon: state.favicon,
       meta: state.meta,
       domHints: state.domHints,
-      htmlSample: state.htmlSample
+      htmlSample: state.htmlSample,
+      storage: state.storage
     });
   }
 

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SnailSploit Recon Extension",
-  "version": "2.0.0",
-  "description": "Pro pentest recon: TLS intel, CORS/cookie analysis, sensitive file detection, WAF fingerprinting, email/intel extraction, form analysis, 50+ secrets, 60+ tech patterns + AI insights!",
+  "version": "2.1.0",
+  "description": "Elite pentest recon: API discovery, cloud resources, GraphQL introspection, WebSocket detection, auth flows, browser storage, HTML reports + ALL v2.0 features!",
   "permissions": [
     "storage",
     "tabs",
