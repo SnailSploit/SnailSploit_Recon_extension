@@ -243,8 +243,8 @@ async function checkSPF(d){ try{ const recs=await dohTXT(d); const m=recs.find(r
 const COMMON_DKIM=["default","google","mail","mandrill","dkim","selector","selector1","selector2","s1","s2","k1","mx","smtp"];
 async function checkDKIM(d){ const found=[]; for(const sel of COMMON_DKIM){ try{ const txts=await dohTXT(`${sel}._domainkey.${d}`); const rec=(txts||[]).find(r=>String(r).toLowerCase().includes("v=dkim1")); if(rec) found.push({selector:sel,record:rec}); if(found.length>=6) break; }catch{} } return {selectors:found}; }
 
-// Subdomain enumeration - Combines passive sources (crt.sh, BufferOver, Anubis)
-// Then performs active DNS resolution to verify live subdomains
+// Subdomain enumeration - OPTIMIZED: Parallel API calls to all sources
+// Combines passive sources (crt.sh, BufferOver, Anubis) concurrently
 async function subdomainsPassive(domain){
   const set = new Set(); const q = domain.replace(/^\*\./, "");
   const cached = subdomainCache.get(q);
@@ -253,75 +253,99 @@ async function subdomainsPassive(domain){
     return cached.data.slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
   }
 
-  // crt.sh - certificate transparency logs
-  try {
-    log(`Fetching subdomains from crt.sh for ${q}...`);
-    const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
-    if (r.ok) {
-      const t = await r.text();
-      let arr = [];
+  // Fetch from all sources in parallel for maximum speed
+  const sources = await Promise.allSettled([
+    // crt.sh - certificate transparency logs
+    (async () => {
       try {
-        arr = JSON.parse(t);
-      } catch {
-        // Handle NDJSON format
-        arr = t.trim().split("\n").map(x => {
-          try { return JSON.parse(x); } catch { return null; }
-        }).filter(Boolean);
-      }
-      for (const row of arr) {
-        const names = String(row.name_value || "").split(/\n+/);
-        for (const n of names) {
-          if (n && n.endsWith(q)) set.add(n.replace(/^\*\./, ""));
+        log(`Fetching subdomains from crt.sh for ${q}...`);
+        const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+        if (r.ok) {
+          const t = await r.text();
+          let arr = [];
+          try {
+            arr = JSON.parse(t);
+          } catch {
+            // Handle NDJSON format
+            arr = t.trim().split("\n").map(x => {
+              try { return JSON.parse(x); } catch { return null; }
+            }).filter(Boolean);
+          }
+          const results = [];
+          for (const row of arr) {
+            const names = String(row.name_value || "").split(/\n+/);
+            for (const n of names) {
+              if (n && n.endsWith(q)) results.push(n.replace(/^\*\./, ""));
+            }
+          }
+          log(`crt.sh found ${results.length} subdomains`);
+          return results;
         }
+      } catch (e) {
+        logError(`crt.sh lookup failed for ${q}:`, e);
       }
-      log(`crt.sh found ${set.size} subdomains`);
+      return [];
+    })(),
+
+    // BufferOver - DNS aggregator
+    (async () => {
+      try {
+        log(`Fetching subdomains from BufferOver for ${q}...`);
+        const r = await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+        if (r.ok) {
+          const j = await r.json();
+          const results = [];
+          for (const line of (j.FDNS_A || [])) {
+            const d = (line.split(",")[1] || "").trim();
+            if (d && d.endsWith(q)) results.push(d);
+          }
+          for (const line of (j.FDNS_AAAA || [])) {
+            const d = (line.split(",")[1] || "").trim();
+            if (d && d.endsWith(q)) results.push(d);
+          }
+          log(`BufferOver found ${results.length} subdomains`);
+          return results;
+        }
+      } catch (e) {
+        logError(`BufferOver lookup failed for ${q}:`, e);
+      }
+      return [];
+    })(),
+
+    // Anubis - subdomain aggregator
+    (async () => {
+      try {
+        log(`Fetching subdomains from Anubis for ${q}...`);
+        const r = await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+        if (r.ok) {
+          const arr = await r.json();
+          const results = [];
+          for (const d of arr) {
+            if (typeof d === "string" && d.endsWith(q)) results.push(d);
+          }
+          log(`Anubis found ${results.length} subdomains`);
+          return results;
+        }
+      } catch (e) {
+        logError(`Anubis lookup failed for ${q}:`, e);
+      }
+      return [];
+    })()
+  ]);
+
+  // Merge all results
+  for (const result of sources) {
+    if (result.status === 'fulfilled' && Array.isArray(result.value)) {
+      result.value.forEach(sub => set.add(sub));
     }
-  } catch (e) {
-    logError(`crt.sh lookup failed for ${q}:`, e);
   }
 
-  // BufferOver - DNS aggregator
-  try {
-    log(`Fetching subdomains from BufferOver for ${q}...`);
-    const r = await fetchWithTimeout(`https://dns.bufferover.run/dns?q=.${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
-    if (r.ok) {
-      const j = await r.json();
-      const initialSize = set.size;
-      for (const line of (j.FDNS_A || [])) {
-        const d = (line.split(",")[1] || "").trim();
-        if (d && d.endsWith(q)) set.add(d);
-      }
-      for (const line of (j.FDNS_AAAA || [])) {
-        const d = (line.split(",")[1] || "").trim();
-        if (d && d.endsWith(q)) set.add(d);
-      }
-      log(`BufferOver added ${set.size - initialSize} new subdomains`);
-    }
-  } catch (e) {
-    logError(`BufferOver lookup failed for ${q}:`, e);
-  }
-
-  // Anubis - subdomain aggregator
-  try {
-    log(`Fetching subdomains from Anubis for ${q}...`);
-    const r = await fetchWithTimeout(`https://jldc.me/anubis/subdomains/${encodeURIComponent(q)}`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
-    if (r.ok) {
-      const arr = await r.json();
-      const initialSize = set.size;
-      for (const d of arr) {
-        if (typeof d === "string" && d.endsWith(q)) set.add(d);
-      }
-      log(`Anubis added ${set.size - initialSize} new subdomains`);
-    }
-  } catch (e) {
-    logError(`Anubis lookup failed for ${q}:`, e);
-  }
-
-  log(`Total ${set.size} unique subdomains found for ${q}`);
+  log(`Total ${set.size} unique subdomains found for ${q} (parallel fetch)`);
   const list = [...set].slice(0, CONFIG.LIMITS.MAX_SUBDOMAINS);
   setBoundedCache(subdomainCache, q, { ts: Date.now(), data: list });
   return list;
 }
+
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
   async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch{} } }
@@ -345,6 +369,390 @@ function mmh3_32_from_b64(b64){
 }
 // Fetches favicon and computes its mmh3 hash for fingerprinting
 async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
+
+// TLS/SSL Certificate Analysis - Extract certificate details for security assessment
+async function getTLSInfo(hostname) {
+  try {
+    log(`Fetching TLS certificate info for ${hostname}...`);
+    // Use crt.sh API to get certificate details
+    const r = await fetchWithTimeout(`https://crt.sh/?q=${encodeURIComponent(hostname)}&output=json`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
+    if (!r.ok) return null;
+
+    const certs = await r.json();
+    if (!Array.isArray(certs) || certs.length === 0) return null;
+
+    // Get the most recent cert
+    const latest = certs.sort((a, b) => new Date(b.entry_timestamp) - new Date(a.entry_timestamp))[0];
+
+    // Parse SANs (Subject Alternative Names) for subdomain intel
+    const sans = new Set();
+    if (latest.name_value) {
+      latest.name_value.split('\n').forEach(n => {
+        const clean = n.trim().replace(/^\*\./, '');
+        if (clean && clean.includes('.')) sans.add(clean);
+      });
+    }
+
+    return {
+      issuer: latest.issuer_name || 'Unknown',
+      notBefore: latest.not_before,
+      notAfter: latest.not_after,
+      serialNumber: latest.serial_number,
+      sans: Array.from(sans).slice(0, 100),
+      commonName: latest.common_name
+    };
+  } catch (e) {
+    logError(`TLS info fetch failed for ${hostname}:`, e);
+    return null;
+  }
+}
+
+// CORS Misconfiguration Detection - Test for overly permissive CORS policies
+async function checkCORS(url) {
+  try {
+    log(`Checking CORS policy for ${url}...`);
+    const testOrigins = [
+      'https://evil.com',
+      'null',
+      url.replace(/^https?:\/\//, 'https://attacker.')
+    ];
+
+    const findings = [];
+    for (const origin of testOrigins) {
+      try {
+        const r = await fetchWithTimeout(url, {
+          method: 'GET',
+          headers: { 'Origin': origin }
+        }, 3000);
+
+        const acao = r.headers.get('access-control-allow-origin');
+        const acac = r.headers.get('access-control-allow-credentials');
+
+        if (acao === '*') {
+          findings.push({ type: 'wildcard', detail: 'ACAO: * (allows any origin)' });
+        } else if (acao === origin) {
+          findings.push({ type: 'reflected', detail: `ACAO reflects: ${origin}`, credentials: acac === 'true' });
+        } else if (acao === 'null') {
+          findings.push({ type: 'null_origin', detail: 'ACAO: null (sandbox bypass risk)' });
+        }
+      } catch {}
+    }
+
+    return findings.length > 0 ? findings : null;
+  } catch (e) {
+    logError(`CORS check failed for ${url}:`, e);
+    return null;
+  }
+}
+
+// HTTP Methods Enumeration - Discover allowed HTTP methods
+async function probeHTTPMethods(url) {
+  try {
+    log(`Probing HTTP methods for ${url}...`);
+    const r = await fetchWithTimeout(url, { method: 'OPTIONS' }, 3000);
+
+    const allow = r.headers.get('allow');
+    const acao = r.headers.get('access-control-allow-methods');
+
+    const methods = new Set();
+    if (allow) allow.split(',').forEach(m => methods.add(m.trim().toUpperCase()));
+    if (acao) acao.split(',').forEach(m => methods.add(m.trim().toUpperCase()));
+
+    const dangerous = ['PUT', 'DELETE', 'TRACE', 'CONNECT', 'PATCH'].filter(m => methods.has(m));
+
+    return {
+      all: Array.from(methods),
+      dangerous: dangerous,
+      risky: dangerous.length > 0
+    };
+  } catch (e) {
+    logError(`HTTP methods probe failed for ${url}:`, e);
+    return null;
+  }
+}
+
+// Sensitive File/Directory Probing - Check for exposed sensitive files
+async function probeSensitiveFiles(origin) {
+  const sensitiveFiles = [
+    '/.git/config',
+    '/.git/HEAD',
+    '/.env',
+    '/.env.local',
+    '/.env.production',
+    '/config.json',
+    '/package.json',
+    '/composer.json',
+    '/web.config',
+    '/.htaccess',
+    '/phpinfo.php',
+    '/server-status',
+    '/admin',
+    '/.well-known/security.txt',
+    '/backup.zip',
+    '/backup.tar.gz',
+    '/database.sql',
+    '/db.sql',
+    '/.DS_Store',
+    '/Dockerfile',
+    '/.dockerignore',
+    '/docker-compose.yml',
+    '/.gitlab-ci.yml',
+    '/.github/workflows',
+    '/swagger.json',
+    '/api-docs',
+    '/graphql',
+    '/.svn/entries'
+  ];
+
+  const found = [];
+  const checks = sensitiveFiles.slice(0, 25).map(async (path) => {
+    try {
+      const url = new URL(path, origin).href;
+      const r = await fetchWithTimeout(url, { method: 'HEAD' }, 2000);
+
+      if (r.ok) {
+        const size = r.headers.get('content-length');
+        found.push({
+          path: path,
+          status: r.status,
+          size: size ? parseInt(size) : null,
+          contentType: r.headers.get('content-type')
+        });
+        log(`Found exposed file: ${path} (${r.status})`);
+      }
+    } catch {}
+  });
+
+  await Promise.all(checks);
+  return found.length > 0 ? found : null;
+}
+
+// Extract emails, phone numbers, and other intel from page content
+function extractIntelFromText(html) {
+  const intel = {
+    emails: new Set(),
+    phones: new Set(),
+    socialLinks: new Set(),
+    comments: []
+  };
+
+  // Email extraction
+  const emailRx = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+  const emails = html.match(emailRx);
+  if (emails) emails.forEach(e => intel.emails.add(e.toLowerCase()));
+
+  // Phone number extraction (various formats)
+  const phoneRx = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})/g;
+  const phones = html.match(phoneRx);
+  if (phones) phones.forEach(p => intel.phones.add(p));
+
+  // Social media links
+  const socialRx = /(https?:\/\/)?(www\.)?(twitter|linkedin|facebook|github|instagram|youtube)\.com\/[A-Za-z0-9_\-\.\/]+/gi;
+  const social = html.match(socialRx);
+  if (social) social.forEach(s => intel.socialLinks.add(s));
+
+  // HTML comments (often contain sensitive info)
+  const commentRx = /<!--([\s\S]*?)-->/g;
+  let match;
+  while ((match = commentRx.exec(html)) !== null) {
+    const comment = match[1].trim();
+    if (comment.length > 5 && comment.length < 500) {
+      intel.comments.push(comment);
+    }
+  }
+
+  return {
+    emails: Array.from(intel.emails).slice(0, 50),
+    phones: Array.from(intel.phones).slice(0, 20),
+    socialLinks: Array.from(intel.socialLinks).slice(0, 30),
+    comments: intel.comments.slice(0, 20)
+  };
+}
+
+// Subdomain Takeover Detection - Check if subdomains point to unclaimed services
+async function checkSubdomainTakeover(subdomain, cnames) {
+  const vulnerableServices = [
+    { pattern: /\.herokuapp\.com$/i, service: 'Heroku', message: 'No such app' },
+    { pattern: /\.github\.io$/i, service: 'GitHub Pages', message: "There isn't a GitHub Pages site here" },
+    { pattern: /\.azurewebsites\.net$/i, service: 'Azure', message: 'Error 404' },
+    { pattern: /\.s3\.amazonaws\.com$/i, service: 'AWS S3', message: 'NoSuchBucket' },
+    { pattern: /\.cloudfront\.net$/i, service: 'AWS CloudFront', message: 'The request could not be satisfied' },
+    { pattern: /\.wordpress\.com$/i, service: 'WordPress.com', message: "Do you want to register" },
+    { pattern: /\.pantheonsite\.io$/i, service: 'Pantheon', message: '404 error unknown site' },
+    { pattern: /\.zendesk\.com$/i, service: 'Zendesk', message: 'Help Center Closed' },
+    { pattern: /\.fastly\.net$/i, service: 'Fastly', message: 'Fastly error: unknown domain' },
+    { pattern: /\.ghost\.io$/i, service: 'Ghost', message: 'The thing you were looking for is no longer here' }
+  ];
+
+  if (!Array.isArray(cnames) || cnames.length === 0) return null;
+
+  for (const cname of cnames) {
+    for (const vuln of vulnerableServices) {
+      if (vuln.pattern.test(cname)) {
+        // Found potential takeover - try to verify
+        try {
+          const r = await fetchWithTimeout(`https://${subdomain}`, {}, 3000);
+          const text = await r.text();
+
+          if (text.includes(vuln.message) || r.status === 404) {
+            return {
+              subdomain: subdomain,
+              cname: cname,
+              service: vuln.service,
+              vulnerable: true,
+              confidence: 'high'
+            };
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return null;
+}
+
+// Form Analysis - Identify input fields and sensitive forms
+function analyzeForms(html) {
+  const forms = [];
+  const formRx = /<form[\s\S]*?<\/form>/gi;
+  const inputRx = /<input[^>]*>/gi;
+
+  let formMatch;
+  while ((formMatch = formRx.exec(html)) !== null) {
+    const formHTML = formMatch[0];
+    const action = (formHTML.match(/action=["']([^"']+)["']/i) || [])[1];
+    const method = (formHTML.match(/method=["']([^"']+)["']/i) || [])[1] || 'GET';
+
+    const inputs = [];
+    let inputMatch;
+    while ((inputMatch = inputRx.exec(formHTML)) !== null) {
+      const inputHTML = inputMatch[0];
+      const type = (inputHTML.match(/type=["']([^"']+)["']/i) || [])[1] || 'text';
+      const name = (inputHTML.match(/name=["']([^"']+)["']/i) || [])[1];
+
+      inputs.push({ type, name });
+    }
+
+    const hasPassword = inputs.some(i => i.type === 'password');
+    const hasHidden = inputs.some(i => i.type === 'hidden');
+
+    forms.push({
+      action,
+      method: method.toUpperCase(),
+      inputs: inputs.length,
+      hasPassword,
+      hasHidden,
+      sensitive: hasPassword || method.toUpperCase() === 'GET' && hasPassword
+    });
+  }
+
+  return forms.length > 0 ? forms.slice(0, 20) : null;
+}
+
+// Enhanced WAF Detection - More comprehensive fingerprinting
+function detectWAF(headers, html) {
+  const wafSignatures = [
+    { name: 'Cloudflare', headers: ['cf-ray', 'cf-cache-status'], html: /cdn-cgi\//, cookie: '__cfduid' },
+    { name: 'AWS WAF', headers: ['x-amzn-requestid', 'x-amz-cf-id'] },
+    { name: 'Akamai', headers: ['x-akamai-transformed'], html: /akamai/i },
+    { name: 'Imperva/Incapsula', headers: ['x-iinfo'], cookie: 'incap_ses|visid_incap' },
+    { name: 'Sucuri', headers: ['x-sucuri-id', 'x-sucuri-cache'] },
+    { name: 'ModSecurity', html: /mod_security|NOYB/i },
+    { name: 'Wordfence', html: /wordfence/i },
+    { name: 'StackPath', headers: ['x-stackpath-shield'] },
+    { name: 'Barracuda', html: /barra_counter_session|BNI__BARRACUDA_LB_COOKIE/i },
+    { name: 'F5 BIG-IP', headers: ['x-wa-info'], cookie: 'TS[a-z0-9]{6}' },
+    { name: 'Fortinet FortiWeb', cookie: 'FORTIWAFSID' },
+    { name: 'Citrix NetScaler', cookie: 'ns_af|citrix_ns_id|NSC_' }
+  ];
+
+  const detected = [];
+  const headerStr = JSON.stringify(headers).toLowerCase();
+  const htmlStr = (html || '').toLowerCase();
+
+  for (const waf of wafSignatures) {
+    let match = false;
+
+    if (waf.headers) {
+      match = waf.headers.some(h => headerStr.includes(h.toLowerCase()));
+    }
+
+    if (!match && waf.html && html) {
+      match = waf.html.test(htmlStr);
+    }
+
+    if (!match && waf.cookie) {
+      const cookieHeader = headers['set-cookie'] || headers['cookie'] || '';
+      match = new RegExp(waf.cookie, 'i').test(cookieHeader);
+    }
+
+    if (match) {
+      detected.push(waf.name);
+    }
+  }
+
+  return detected.length > 0 ? detected : null;
+}
+
+// Cookie Security Analysis - Check HttpOnly, Secure, SameSite flags
+function analyzeCookies(headers) {
+  const setCookie = headers['set-cookie'];
+  if (!setCookie) return null;
+
+  const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
+  const analysis = [];
+
+  for (const cookie of cookies) {
+    const name = (cookie.split('=')[0] || '').trim();
+    const hasHttpOnly = /httponly/i.test(cookie);
+    const hasSecure = /secure/i.test(cookie);
+    const sameSite = (cookie.match(/samesite=([^;]+)/i) || [])[1];
+
+    const issues = [];
+    if (!hasHttpOnly) issues.push('Missing HttpOnly');
+    if (!hasSecure) issues.push('Missing Secure');
+    if (!sameSite) issues.push('Missing SameSite');
+
+    analysis.push({
+      name,
+      httpOnly: hasHttpOnly,
+      secure: hasSecure,
+      sameSite: sameSite || null,
+      issues
+    });
+  }
+
+  return analysis;
+}
+
+// JavaScript Library Detection with CVE mapping
+function detectJSLibraries(html, scripts) {
+  const libraries = [];
+  const allContent = html + ' ' + (scripts || []).join(' ');
+
+  const libPatterns = [
+    { name: 'jQuery', rx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+)|min)/i },
+    { name: 'Angular', rx: /angular(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'React', rx: /react(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'Vue', rx: /vue(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'Bootstrap', rx: /bootstrap(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'Lodash', rx: /lodash(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'Moment.js', rx: /moment(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
+    { name: 'D3', rx: /d3(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i }
+  ];
+
+  for (const lib of libPatterns) {
+    const match = allContent.match(lib.rx);
+    if (match) {
+      libraries.push({
+        name: lib.name,
+        version: match[1] || 'unknown'
+      });
+    }
+  }
+
+  return libraries.length > 0 ? libraries : null;
+}
 
 // Secrets scanner - Comprehensive patterns for exposed credentials, API keys, and sensitive data
 // Over 40 patterns covering major cloud providers, SaaS platforms, and crypto
@@ -816,13 +1224,46 @@ function deriveHighlights(state){
   const perIp = state.perIp || {};
   const secrets = state.secrets || [];
 
+  // Security Headers
   const missingHeaders = ["content-security-policy","strict-transport-security","x-frame-options","x-content-type-options","referrer-policy"].filter(h=>!headers[h]);
   if(missingHeaders.length) items.push({ severity:"high", title:"Missing security headers", detail: missingHeaders.join(", ") });
 
+  // Cookie Security
+  if(state.cookieSecurity && state.cookieSecurity.length > 0) {
+    const insecureCookies = state.cookieSecurity.filter(c => c.issues && c.issues.length > 0);
+    if(insecureCookies.length) items.push({ severity:"medium", title:"Insecure cookies detected", detail:`${insecureCookies.length} cookies missing security flags` });
+  }
+
+  // CORS Misconfigurations
+  if(state.corsFindings && state.corsFindings.length > 0) {
+    const critical = state.corsFindings.find(f => f.credentials);
+    if(critical) items.push({ severity:"critical", title:"CORS allows credentials + reflected origin", detail:"Possible credential theft via CORS" });
+    else items.push({ severity:"high", title:"CORS misconfiguration detected", detail:`${state.corsFindings.length} issues found` });
+  }
+
+  // Sensitive Files
+  if(state.sensitiveFiles && state.sensitiveFiles.length > 0) {
+    const criticalFiles = state.sensitiveFiles.filter(f => f.path.includes('.git') || f.path.includes('.env'));
+    if(criticalFiles.length) items.push({ severity:"critical", title:"Exposed sensitive files", detail:criticalFiles.map(f=>f.path).slice(0,3).join(", ") });
+    else items.push({ severity:"high", title:"Sensitive files accessible", detail:`${state.sensitiveFiles.length} files found` });
+  }
+
+  // Dangerous HTTP Methods
+  if(state.httpMethods?.risky) {
+    items.push({ severity:"high", title:"Dangerous HTTP methods allowed", detail:state.httpMethods.dangerous.join(", ") });
+  }
+
+  // WAF Detection
+  if(state.waf && state.waf.length > 0) {
+    items.push({ severity:"low", title:`WAF detected: ${state.waf.join(", ")}`, detail:"Evasion techniques may be required" });
+  }
+
+  // Email Posture
   const dmarc = state.dmarc; const spf = state.spf;
   if(dmarc && !dmarc.present) items.push({ severity:"medium", title:"DMARC not found", detail:"Email spoofing resilience unknown" });
   if(spf && !spf.present) items.push({ severity:"low", title:"SPF missing", detail:"Sender validation record not found" });
 
+  // Network Intelligence
   const openPorts = new Set(); const riskyPorts = new Set();
   const highCves = [];
   for(const [ip,data] of Object.entries(perIp)){
@@ -835,8 +1276,34 @@ function deriveHighlights(state){
   else if(openPorts.size) items.push({ severity:"medium", title:"Open ports observed", detail:[...openPorts].slice(0,10).map(p=>`:${p}`).join(" ") });
   if(highCves.length) items.push({ severity:"critical", title:"High-severity CVEs from CPEs", detail: [...new Set(highCves)].slice(0,8).join(", ") });
 
+  // Secrets
   if(secrets.length) items.push({ severity:"high", title:"Potential secrets/endpoints", detail:`${secrets.length} sources flagged` });
 
+  // Intel Extraction
+  if(state.intel) {
+    if(state.intel.emails && state.intel.emails.length > 0) {
+      items.push({ severity:"low", title:`${state.intel.emails.length} email addresses found`, detail:state.intel.emails.slice(0,3).join(", ") });
+    }
+    if(state.intel.comments && state.intel.comments.length > 0) {
+      items.push({ severity:"medium", title:"HTML comments found", detail:`${state.intel.comments.length} comments (may leak info)` });
+    }
+  }
+
+  // Forms
+  if(state.forms) {
+    const sensitiveForms = state.forms.filter(f => f.sensitive);
+    if(sensitiveForms.length) items.push({ severity:"medium", title:"Sensitive forms detected", detail:`${sensitiveForms.length} forms with passwords or GET methods` });
+  }
+
+  // TLS Certificate
+  if(state.tlsInfo) {
+    const expiry = new Date(state.tlsInfo.notAfter);
+    const daysLeft = Math.floor((expiry - Date.now()) / (1000 * 60 * 60 * 24));
+    if(daysLeft < 30 && daysLeft > 0) items.push({ severity:"low", title:"Certificate expiring soon", detail:`${daysLeft} days remaining` });
+    if(daysLeft < 0) items.push({ severity:"high", title:"Certificate expired", detail:`Expired ${Math.abs(daysLeft)} days ago` });
+  }
+
+  // AI Findings
   const aiHosts = Array.isArray(state.aiEnhancedSubs) ? state.aiEnhancedSubs.length : 0;
   if(aiHosts) items.push({ severity:"medium", title:"AI-relevant hosts", detail:`${aiHosts} prioritized subdomains` });
 
@@ -845,7 +1312,7 @@ function deriveHighlights(state){
 
   if(!state.securityTxt) items.push({ severity:"low", title:"security.txt not found", detail:"No disclosure policy located" });
 
-  return { items: items.slice(0, 8) };
+  return { items: items.slice(0, 12) };
 }
 
 function scheduleHighlights(tabId){
@@ -876,6 +1343,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await patchState(sender.tab.id, { tech });
             scheduleHighlights(sender.tab.id);
           } catch {}
+
+          // Enhanced content analysis with new intel extraction
+          if (msg.htmlSample) {
+            try {
+              const intel = extractIntelFromText(msg.htmlSample);
+              const forms = analyzeForms(msg.htmlSample);
+              const waf = detectWAF(base.headers || {}, msg.htmlSample);
+              const jsLibs = detectJSLibraries(msg.htmlSample, msg.externalScripts || []);
+
+              await patchState(sender.tab.id, {
+                intel,
+                forms,
+                waf,
+                jsLibraries: jsLibs
+              });
+              scheduleHighlights(sender.tab.id);
+            } catch (e) {
+              logError('Intel extraction failed:', e);
+            }
+          }
+
           await runSecretsScan(sender.tab.id, base, msg, new URL(base.url).origin);
           scheduleHighlights(sender.tab.id);
           const mapFinds = await probeSourceMaps(Array.isArray(msg.externalScripts)?msg.externalScripts:[]);
@@ -1029,10 +1517,37 @@ async function analyze(tabId, url){
       }
     })();
 
-    // Domain posture
+    // Domain posture and security checks (now includes TLS cert, CORS, HTTP methods, cookies)
     (async () => {
-      const [domainRDAP, robots, secTxt, dmarc, spf, dkim, mx] = await Promise.allSettled([ rdapDomain(domain), getRobots(u.origin), getSecurityTxt(u.origin), checkDMARC(domain), checkSPF(domain), checkDKIM(domain), dohMX(domain) ]);
-      await patchState(tabId, { domainRDAP: domainRDAP.value||null, robots: robots.value||null, securityTxt: secTxt.value||null, dmarc: dmarc.value||null, spf: spf.value||null, dkim: dkim.value||null, mx: mx.value||null });
+      const [domainRDAP, robots, secTxt, dmarc, spf, dkim, mx, tlsInfo, corsCheck, httpMethods, sensitiveFiles, cookieAnalysis] = await Promise.allSettled([
+        rdapDomain(domain),
+        getRobots(u.origin),
+        getSecurityTxt(u.origin),
+        checkDMARC(domain),
+        checkSPF(domain),
+        checkDKIM(domain),
+        dohMX(domain),
+        getTLSInfo(domain),
+        checkCORS(url),
+        probeHTTPMethods(url),
+        probeSensitiveFiles(u.origin),
+        analyzeCookies(hdrSnap?.headers || {})
+      ]);
+
+      await patchState(tabId, {
+        domainRDAP: domainRDAP.value || null,
+        robots: robots.value || null,
+        securityTxt: secTxt.value || null,
+        dmarc: dmarc.value || null,
+        spf: spf.value || null,
+        dkim: dkim.value || null,
+        mx: mx.value || null,
+        tlsInfo: tlsInfo.value || null,
+        corsFindings: corsCheck.value || null,
+        httpMethods: httpMethods.value || null,
+        sensitiveFiles: sensitiveFiles.value || null,
+        cookieSecurity: cookieAnalysis.value || null
+      });
       scheduleHighlights(tabId);
     })();
 

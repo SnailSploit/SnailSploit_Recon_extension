@@ -1,11 +1,11 @@
 
 // Content script - Extracts page resources and DOM hints for security analysis
-// Runs on every page to collect: scripts, meta tags, favicon, and resource paths
+// Runs on every page to collect: scripts, meta tags, favicon, HTML samples, and resource paths
 (function(){
   const abs = (u) => { try { return new URL(u, location.href).href; } catch { return null; } };
-  const state = { external: new Set(), inline: [], favicon: null, meta: {}, domHints: { paths: [] }, lastSent: 0 };
+  const state = { external: new Set(), inline: [], favicon: null, meta: {}, domHints: { paths: [] }, htmlSample: null, lastSent: 0 };
 
-  // Capture current page state: scripts, meta tags, links, and favicon
+  // Capture current page state: scripts, meta tags, links, favicon, and HTML sample
   function snapshot(){
     try {
       document.querySelectorAll('script').forEach(s => {
@@ -29,6 +29,10 @@
         const icon = document.querySelector('link[rel~="icon"]');
         state.favicon = icon && icon.href ? abs(icon.href) : abs('/favicon.ico');
       }
+      // Capture HTML sample for intel extraction (emails, comments, forms, etc.)
+      if (!state.htmlSample && document.documentElement) {
+        state.htmlSample = document.documentElement.outerHTML.slice(0, 100000); // 100KB limit
+      }
     } catch {}
   }
 
@@ -44,7 +48,8 @@
       inlineScripts: state.inline.slice(0, 16),
       favicon: state.favicon,
       meta: state.meta,
-      domHints: state.domHints
+      domHints: state.domHints,
+      htmlSample: state.htmlSample
     });
   }
 
