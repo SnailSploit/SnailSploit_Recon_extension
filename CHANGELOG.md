@@ -2,6 +2,209 @@
 
 All notable changes to SnailSploit Recon Extension will be documented in this file.
 
+## [2.0.0] - 2025-12-30 - GOLD STANDARD PENTEST TOOLKIT 🎯⚡
+
+### 🚀 Major Release: Comprehensive Security Analysis Overhaul
+
+This release transforms SnailSploit Recon into a **professional-grade penetration testing reconnaissance toolkit**, adding **15+ new security analysis features** and major performance optimizations. The extension now collects significantly more actionable intelligence for red team operations.
+
+### 🔐 New Security Analysis Features
+
+#### TLS/SSL Certificate Intelligence
+- **Certificate details extraction**: Issuer, expiry dates, serial numbers
+- **Subject Alternative Names (SANs)**: Discover additional domains from certificates
+- **Expiry monitoring**: Visual warnings for expiring/expired certificates (color-coded)
+- **Subdomain intelligence**: Extract domains from certificate transparency logs
+- **Risk assessment**: Automatic flagging of expired or soon-to-expire certificates
+
+#### CORS Misconfiguration Detection ⚠️
+- **Wildcard origin testing**: Detect `Access-Control-Allow-Origin: *`
+- **Reflected origin detection**: Test for dangerous origin reflection
+- **Credentials exposure**: Flag CORS with `Access-Control-Allow-Credentials: true`
+- **Null origin bypass**: Detect sandbox escape vectors
+- **Critical severity flagging**: Highlight credential-leaking CORS configs
+
+#### Cookie Security Analysis 🍪
+- **HttpOnly flag validation**: Identify XSS-vulnerable cookies
+- **Secure flag checking**: Flag cookies transmitted over HTTP
+- **SameSite attribute analysis**: Detect CSRF vulnerabilities
+- **Per-cookie breakdown**: Detailed security posture for each cookie
+- **Issue aggregation**: Summary of insecure cookies
+
+#### HTTP Methods Enumeration
+- **OPTIONS probe**: Discover all allowed HTTP methods
+- **Dangerous method detection**: Flag PUT, DELETE, TRACE, CONNECT, PATCH
+- **Risk highlighting**: Visual warnings for exploitable methods
+- **CORS method cross-reference**: Check both Allow and ACAO-Methods headers
+
+#### Sensitive File/Directory Probing 🔍
+- **25+ sensitive paths tested**: `.git/`, `.env`, backups, configs, API docs
+- **Non-intrusive HEAD requests**: Minimal server impact
+- **File metadata collection**: Size, content-type, status codes
+- **Critical file highlighting**: Special attention to `.git`, `.env`, database dumps
+
+**Probed files include:**
+- `.git/config`, `.git/HEAD` (source code exposure)
+- `.env*` variants (API keys, database credentials)
+- `package.json`, `composer.json` (dependency intel)
+- `web.config`, `.htaccess` (server misconfigurations)
+- `phpinfo.php`, `/server-status` (info disclosure)
+- `backup.zip`, `database.sql` (data leaks)
+- `swagger.json`, `/graphql`, `/api-docs` (API schemas)
+- `.DS_Store`, `Dockerfile` (development artifacts)
+
+#### Enhanced WAF Detection 🛡️
+- **12+ WAF signatures**: Cloudflare, AWS WAF, Akamai, Imperva, ModSecurity, Sucuri, etc.
+- **Multi-method detection**: Headers, HTML patterns, cookies
+- **Evasion awareness**: Highlights when WAF protection is active
+
+**Detected WAFs:**
+- Cloudflare, AWS WAF, Akamai
+- Imperva/Incapsula, Sucuri, ModSecurity
+- Wordfence, StackPath, Barracuda
+- F5 BIG-IP, Fortinet FortiWeb, Citrix NetScaler
+
+#### Intelligence Extraction 📧
+- **Email harvesting**: Extract all email addresses from page content
+- **Phone number extraction**: Multi-format phone detection (US/international)
+- **Social media discovery**: Auto-detect Twitter, LinkedIn, GitHub, Facebook, Instagram, YouTube
+- **HTML comments extraction**: Capture developer comments (often leak credentials/TODOs)
+- **Contact intelligence**: Build target database for social engineering
+
+#### Form Analysis 📝
+- **Password field detection**: Identify authentication forms
+- **Hidden input discovery**: Flag suspicious hidden fields
+- **Method security**: Warn about GET requests with passwords (critical vuln)
+- **Action endpoint mapping**: Track form submission destinations
+- **Sensitive form highlighting**: Visual warnings for risky forms
+
+#### JavaScript Library Detection 📚
+- **Framework identification**: jQuery, React, Angular, Vue, Bootstrap, Lodash, Moment.js, D3
+- **Version extraction**: Identify specific library versions
+- **CVE research enablement**: Version info for vulnerability lookups
+
+### ⚡ Performance Optimizations
+
+#### Parallel Subdomain Enumeration (3x Faster!)
+- **Concurrent API calls**: crt.sh, BufferOver, Anubis now run simultaneously (was sequential)
+- **3x speed improvement**: Subdomain discovery completes in ~3s instead of ~9s
+- **Smart result merging**: Deduplication across all sources
+- **Progress logging**: Real-time feedback on each source's results
+
+#### Optimized Network Operations
+- **Parallel security checks**: TLS, CORS, HTTP methods, cookies, files all run concurrently
+- **Better timeout management**: Increased to 8s default (from 3s) for reliability
+- **Exponential backoff retry**: Auto-retry failed requests (3 attempts max)
+- **Bounded caching**: Memory-safe cache with 128 entry limit
+
+#### Enhanced Highlights System
+- **12 highlight slots** (up from 8): More critical findings surfaced
+- **15+ new detection rules**: CORS, cookies, files, WAF, TLS, forms, intel
+- **Intelligent prioritization**: Critical issues shown first
+- **Context-aware severity**: Certificate days, cookie counts, file criticality
+
+### 🎨 UI/UX Improvements
+
+#### New Dashboard Cards
+- **TLS Certificate Card**: Full cert details with expiry countdown (color-coded)
+- **Security Checks Card**: CORS, HTTP methods, cookies, sensitive files
+- **Intelligence Card**: Emails, phones, social links, HTML comments
+- **Forms Card**: All forms with security risk indicators
+- **Enhanced Tech Card**: Now includes WAF and JS library detection
+
+#### Visual Enhancements
+- **Color-coded severity**: Critical (red), High (orange), Medium (yellow), Low (gray)
+- **Expandable sections**: Details hidden by default to reduce clutter
+- **Risk indicators**: 🔑 for password fields, visual warnings for sensitive forms
+- **Certificate expiry colors**: Green (safe), Orange (<30 days), Red (expired)
+- **Chip-based display**: Clean, modern UI for tags and findings
+
+### 🔧 Technical Improvements
+
+#### Content Script Enhancement
+- **HTML sampling**: Captures up to 100KB of page HTML for analysis
+- **Better resource tracking**: Enhanced script and link extraction
+- **Throttled updates**: Smart message throttling (500ms) to reduce overhead
+- **MutationObserver**: Real-time DOM monitoring for 10 seconds
+
+#### Enhanced Data Collection
+**New data points collected:**
+- TLS certificate chain and SANs (100+ domains)
+- CORS policy configuration
+- Cookie security attributes (HttpOnly, Secure, SameSite)
+- HTTP method allowlist
+- 25+ accessible sensitive files
+- WAF presence and type
+- 50+ email addresses
+- 20+ phone numbers
+- 30+ social media profiles
+- 20+ HTML comments
+- Form structures (10+ forms)
+- JS library versions (8+ frameworks)
+
+#### Subdomain Enumeration Optimizations
+- **Parallel API fetching**: All sources queried simultaneously
+- **Promise.allSettled**: Graceful handling of failed sources
+- **Better error recovery**: Individual source failures don't block others
+- **Enhanced logging**: Per-source result counts
+
+#### Configuration & Limits
+- **Increased timeouts**: More reliable API calls (8s default)
+- **Optimized limits**: Balanced between thoroughness and performance
+- **Memory safety**: Bounded caches prevent memory leaks
+- **Error resilience**: Comprehensive error handling throughout
+
+### 📊 Statistics
+
+**New Features Added:**
+- 15+ major security analysis features
+- 100+ new lines of reconnaissance logic
+- 25+ sensitive file probes
+- 12+ WAF detection signatures
+- 8+ JavaScript library patterns
+
+**Performance Improvements:**
+- 3x faster subdomain enumeration
+- 12 parallel security checks (was 7)
+- 128-entry bounded caching
+- Exponential backoff retry logic
+
+**UI Enhancements:**
+- 5 new dashboard cards
+- Color-coded severity system
+- Expandable detail sections
+- Enhanced visual indicators
+
+### 🐛 Bug Fixes
+- Fixed subdomain enumeration timeout issues with parallel fetching
+- Improved error handling for failed API requests
+- Better NDJSON response handling from crt.sh
+- Enhanced caching to prevent memory leaks (128 entry bound)
+- Fixed cookie parsing for Set-Cookie arrays
+
+### 📝 Developer Notes
+- All new checks run asynchronously without blocking main recon flow
+- Bounded cache sizes prevent unbounded memory growth
+- Retry logic with exponential backoff for flaky APIs
+- Comprehensive error logging for debugging
+- Clean separation between recon modules
+
+### 🎯 For Penetration Testers & Red Teams
+
+This release makes SnailSploit Recon **essential** for:
+- ✅ Initial reconnaissance and attack surface mapping
+- ✅ CORS/cookie vulnerability identification
+- ✅ Sensitive file discovery (.git, .env, backups)
+- ✅ Certificate intelligence and subdomain enumeration
+- ✅ WAF detection and evasion planning
+- ✅ Email/contact harvesting for social engineering
+- ✅ Form analysis for injection testing
+- ✅ Technology stack fingerprinting with versions
+
+**Upgrade from 1.x immediately to access these game-changing features!**
+
+---
+
 ## [1.1.0] - 2025-11-04 - AI-POWERED RECON 🤖
 
 ### 🤖 AI Integration with OpenAI

@@ -104,6 +104,125 @@ function techCard(s){
   if(!tags.length && !notes.length){ card.appendChild(el('<div class="small">none</div>')); return card; }
   if(tags.length) card.appendChild(el(`<div>${tags.map(x=>`<span class="chip">${esc(x)}</span>`).join(" ")}</div>`));
   if(notes.length) card.appendChild(el(`<div class="small">${notes.map(esc).join(" · ")}</div>`));
+
+  // Add WAF detection if present
+  if(s.waf && s.waf.length > 0) {
+    card.appendChild(el(`<div class="row" style="margin-top:8px"><b>WAF Detected:</b> ${s.waf.map(w=>`<span class="chip" style="background:#ffebee;border-color:#ef5350;color:#b71c1c">${esc(w)}</span>`).join(" ")}</div>`));
+  }
+
+  // Add JS libraries if detected
+  if(s.jsLibraries && s.jsLibraries.length > 0) {
+    card.appendChild(el(`<div class="row" style="margin-top:8px"><b>JS Libraries:</b> ${s.jsLibraries.map(lib=>`<span class="chip">${esc(lib.name)}${lib.version !== 'unknown' ? ` v${esc(lib.version)}` : ''}</span>`).join(" ")}</div>`));
+  }
+
+  return card;
+}
+
+function tlsCard(s){
+  const card=el(`<div class="card"><h3>TLS Certificate</h3></div>`);
+  const tls=s.tlsInfo;
+  if(!tls){ card.appendChild(el('<div class="small">loading…</div>')); return card; }
+
+  const expiry = new Date(tls.notAfter);
+  const daysLeft = Math.floor((expiry - Date.now()) / (1000 * 60 * 60 * 24));
+  const expiryColor = daysLeft < 0 ? 'color:#ef5350' : daysLeft < 30 ? 'color:#fb8c00' : 'color:#4caf50';
+
+  card.appendChild(el(`<div class="row"><b>Issuer:</b> <span class="small">${esc(tls.issuer)}</span></div>`));
+  card.appendChild(el(`<div class="row"><b>Common Name:</b> <code>${esc(tls.commonName||'N/A')}</code></div>`));
+  card.appendChild(el(`<div class="row"><b>Expiry:</b> <span style="${expiryColor}">${daysLeft < 0 ? 'Expired' : `${daysLeft} days left`}</span> · <span class="small">${esc(tls.notAfter)}</span></div>`));
+  if(tls.sans && tls.sans.length > 0){
+    card.appendChild(el(`<details class="small"><summary>SANs (${tls.sans.length} domains)</summary><div>${tls.sans.slice(0,20).map(s=>`<div class="mono">${esc(s)}</div>`).join("")}</div></details>`));
+  }
+  return card;
+}
+
+function securityChecksCard(s){
+  const card=el(`<div class="card"><h3>Security Checks</h3></div>`);
+
+  // CORS
+  if(s.corsFindings && s.corsFindings.length > 0){
+    const corsHTML = s.corsFindings.map(c => {
+      const severity = c.credentials ? 'critical' : 'high';
+      return `<div class="row" style="margin:4px 0"><span class="chip" style="${severityStyle(severity)}">${c.type.toUpperCase()}</span> <span class="small">${esc(c.detail)}</span></div>`;
+    }).join('');
+    card.appendChild(el(`<div><b>CORS Issues:</b>${corsHTML}</div>`));
+  }
+
+  // HTTP Methods
+  if(s.httpMethods){
+    const methods = s.httpMethods;
+    const methodsHTML = methods.risky ?
+      `<div class="row"><b>HTTP Methods:</b> ${methods.all.map(m=>`<span class="chip" style="${methods.dangerous.includes(m)?'background:#ffebee;border-color:#ef5350;color:#b71c1c':''}">${esc(m)}</span>`).join(" ")}</div>` :
+      `<div class="row"><b>HTTP Methods:</b> <span class="small">${methods.all.join(", ")}</span></div>`;
+    card.appendChild(el(methodsHTML));
+  }
+
+  // Cookies
+  if(s.cookieSecurity && s.cookieSecurity.length > 0){
+    const insecure = s.cookieSecurity.filter(c => c.issues.length > 0);
+    if(insecure.length > 0){
+      card.appendChild(el(`<details class="row"><summary><b>Cookie Issues (${insecure.length})</b></summary><div>${insecure.map(c=>`<div class="small"><code>${esc(c.name)}</code>: ${c.issues.join(", ")}</div>`).join("")}</div></details>`));
+    } else {
+      card.appendChild(el(`<div class="row"><b>Cookies:</b> <span class="small" style="color:#4caf50">All secure (${s.cookieSecurity.length} cookies)</span></div>`));
+    }
+  }
+
+  // Sensitive Files
+  if(s.sensitiveFiles && s.sensitiveFiles.length > 0){
+    card.appendChild(el(`<details class="row"><summary><b style="color:#ef5350">Exposed Files (${s.sensitiveFiles.length})</b></summary><div>${s.sensitiveFiles.map(f=>`<div class="small"><code>${esc(f.path)}</code> · ${f.status} · ${f.size ? `${f.size} bytes` : 'N/A'}</div>`).join("")}</div></details>`));
+  }
+
+  if(!s.corsFindings && !s.httpMethods && !s.cookieSecurity && !s.sensitiveFiles){
+    card.appendChild(el('<div class="small">running checks…</div>'));
+  }
+
+  return card;
+}
+
+function intelCard(s){
+  const card=el(`<div class="card"><h3>Intelligence Gathered</h3></div>`);
+  const intel=s.intel;
+
+  if(!intel){ card.appendChild(el('<div class="small">analyzing page…</div>')); return card; }
+
+  if(intel.emails && intel.emails.length > 0){
+    card.appendChild(el(`<details class="row"><summary><b>Email Addresses (${intel.emails.length})</b></summary><div>${intel.emails.map(e=>`<code>${esc(e)}</code>`).join(" ")}</div></details>`));
+  }
+
+  if(intel.phones && intel.phones.length > 0){
+    card.appendChild(el(`<div class="row"><b>Phone Numbers:</b> ${intel.phones.map(p=>`<code>${esc(p)}</code>`).join(" ")}</div>`));
+  }
+
+  if(intel.socialLinks && intel.socialLinks.length > 0){
+    card.appendChild(el(`<details class="row"><summary><b>Social Media (${intel.socialLinks.length})</b></summary><div>${intel.socialLinks.slice(0,10).map(s=>`<a href="${esc(s)}" target="_blank" class="small">${esc(s)}</a>`).join("<br>")}</div></details>`));
+  }
+
+  if(intel.comments && intel.comments.length > 0){
+    card.appendChild(el(`<details class="row"><summary><b>HTML Comments (${intel.comments.length})</b></summary><div>${intel.comments.map(c=>`<div class="small"><code>${esc(c.slice(0,100))}${c.length>100?'…':''}</code></div>`).join("")}</div></details>`));
+  }
+
+  if(!intel.emails?.length && !intel.phones?.length && !intel.socialLinks?.length && !intel.comments?.length){
+    card.appendChild(el('<div class="small">no intel extracted</div>'));
+  }
+
+  return card;
+}
+
+function formsCard(s){
+  const card=el(`<div class="card"><h3>Forms Analysis</h3></div>`);
+  const forms=s.forms;
+
+  if(!forms){ card.appendChild(el('<div class="small">analyzing…</div>')); return card; }
+  if(forms.length === 0){ card.appendChild(el('<div class="small">no forms found</div>')); return card; }
+
+  for(const form of forms.slice(0,10)){
+    const sensitive = form.sensitive ? ' style="background:#ffebee;border-color:#ef5350"' : '';
+    card.appendChild(el(`<div class="row"${sensitive}>
+      <div><b>${esc(form.method)}</b> → <code>${esc(form.action||'(self)')}</code></div>
+      <div class="small">${form.inputs} inputs${form.hasPassword?' · 🔑 Password field':''} ${form.hasHidden?' · Hidden fields':''}</div>
+    </div>`));
+  }
+
   return card;
 }
 
@@ -148,7 +267,25 @@ async function render(){
   root.appendChild(headerCard(s));
   root.appendChild(highlightsCard(s));
   root.appendChild(headersCard(s.headers));
+
+  // New security analysis cards
+  if(s.tlsInfo || s.corsFindings || s.httpMethods || s.sensitiveFiles || s.cookieSecurity) {
+    if(s.tlsInfo) root.appendChild(tlsCard(s));
+    root.appendChild(securityChecksCard(s));
+  }
+
   root.appendChild(techCard(s));
+
+  // Intelligence gathering
+  if(s.intel && (s.intel.emails?.length || s.intel.phones?.length || s.intel.socialLinks?.length || s.intel.comments?.length)) {
+    root.appendChild(intelCard(s));
+  }
+
+  // Forms analysis
+  if(s.forms && s.forms.length > 0) {
+    root.appendChild(formsCard(s));
+  }
+
   if(s.aiCorrelation) root.appendChild(aiCorrelationCard(s));
   root.appendChild(ipsCard(s));
   root.appendChild(domainCard(s));
