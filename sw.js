@@ -126,8 +126,8 @@ function pickSecurityHeaders(tabId){
   }};
 }
 async function fetchHeadersFallback(url){
-  try{ const r=await fetchWithTimeout(url,{method:"HEAD"},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch{}
-  try{ const r=await fetchWithTimeout(url,{method:"GET",headers:{"Range":"bytes=0-0"}},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch{}
+  try{ const r=await fetchWithTimeout(url,{method:"HEAD"},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch(e){ log(`HEAD fallback failed for ${url}:`, e.message); }
+  try{ const r=await fetchWithTimeout(url,{method:"GET",headers:{"Range":"bytes=0-0"}},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch(e){ log(`GET-Range fallback failed for ${url}:`, e.message); }
   return null;
 }
 
@@ -152,7 +152,7 @@ async function dohResolve(name, type){
         setBoundedCache(dohCache, key, { ts: now, ans: j.Answer });
         return j.Answer;
       }
-    } catch {}
+    } catch (e) { log(`DoH resolver failed (${u}):`, e.message); }
   }
   setBoundedCache(dohCache, key, { ts: now, ans: [] });
   return [];
@@ -183,6 +183,12 @@ async function resolveIPs(hostname){
 async function fetchJSON(url, opts = {}, timeout = CONFIG.TIMEOUTS.FETCH_JSON) {
   return retryWithBackoff(async () => {
     const r = await fetchWithTimeout(url, { ...opts }, timeout);
+    if (r.status === 429) {
+      const retryAfter = parseInt(r.headers.get('retry-after') || '5', 10);
+      log(`Rate limited (429) on ${url}, waiting ${retryAfter}s`);
+      await new Promise(res => setTimeout(res, retryAfter * 1000));
+      throw new Error(`Rate limited (429) for ${url}`);
+    }
     if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
     return r.json();
   }, 2, `fetchJSON(${url})`);
@@ -355,7 +361,7 @@ async function subdomainsPassive(domain){
 
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
-  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch{} } }
+  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch(e){ log(`DNS resolve failed for ${s}:`, e.message); } } }
   await Promise.all(Array.from({length:limit},worker)); return out.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_LIVE);
 }
 
@@ -473,7 +479,7 @@ async function checkCORS(url) {
         } else if (acao === 'null') {
           findings.push({ type: 'null_origin', detail: 'ACAO: null (sandbox bypass risk)' });
         }
-      } catch {}
+      } catch (e) { log(`CORS probe failed for origin ${origin}:`, e.message); }
     }
 
     return findings.length > 0 ? findings : null;
@@ -569,7 +575,7 @@ async function probeSensitiveFiles(origin) {
           contentType: ct
         });
         log(`Confirmed exposed file: ${path} (${r.status}, ct: ${ct})`);
-      } catch {}
+      } catch (e) { log(`Probe ${path} failed:`, e.message); }
     });
     await Promise.all(checks);
     // Small delay between batches to avoid aggressive scanning detection
@@ -588,7 +594,7 @@ function extractIntelFromText(html) {
   };
 
   // Email extraction
-  const emailRx = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+  const emailRx = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
   const emails = html.match(emailRx);
   if (emails) emails.forEach(e => intel.emails.add(e.toLowerCase()));
 
@@ -888,7 +894,7 @@ const SECRET_PATTERNS=[
   {id:"datadog_api_key", rx:/(?:DATADOG|DD)[-_]?(?:API[-_]?KEY|APP[-_]?KEY)[\s:=]+["']?[a-f0-9]{32}["']?/gi}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
-async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await r.text(); return t.slice(0, 300*1024);}catch{ return ""; } }
+async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await Promise.race([r.text(), new Promise((_,rej)=>setTimeout(()=>rej(new Error("body read timeout")),5000))]); return t.slice(0, 300*1024);}catch(e){ log(`fetchText(${url}) failed:`, e.message); return ""; } }
 const scannedByTab=new Map();
 async function probeSourceMaps(urls){
   const out=[];
@@ -984,8 +990,14 @@ If all should be kept, return all. If none are relevant, return [].`;
       return hosts;
     }
 
-    // Parse AI response
-    const filtered = JSON.parse(response.trim());
+    // Parse AI response safely
+    let filtered;
+    try {
+      filtered = JSON.parse(response.trim());
+    } catch (parseErr) {
+      logError(`AI response was not valid JSON, returning all hosts:`, parseErr.message);
+      return hosts;
+    }
     if (Array.isArray(filtered)) {
       log(`AI filtered ${hosts.length} hosts down to ${filtered.length} relevant ones`);
       return filtered;
@@ -1181,30 +1193,49 @@ async function enrichCVEsForCPE(cpe) {
 
   items.sort((a, b) => (Number(b.score || 0) - Number(a.score || 0)));
   const top = items.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS / 2);
-  cveCache.set(cpe, top);
+  setBoundedCache(cveCache, cpe, top);
   log(`Cached ${top.length} CVEs for ${cpe}`);
   return top;
 }
 
 // state
-const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${tabId}`]: data });
-const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
-const patchLocks = new Map();
-async function patchState(tabId, patch){
-  // Serialize concurrent patches per tab to prevent race conditions
-  const key = `tab:${tabId}`;
-  while (patchLocks.get(key)) { await patchLocks.get(key); }
-  let resolve;
-  const lock = new Promise(r => { resolve = r; });
-  patchLocks.set(key, lock);
+async function setTabData(tabId, data) {
   try {
+    await chrome.storage.session.set({ [`tab:${tabId}`]: data });
+  } catch (e) {
+    if (String(e).includes('QUOTA') || String(e).includes('quota')) {
+      logError(`Storage quota exceeded for tab ${tabId}, pruning old data`);
+      // Trim large fields to fit within quota
+      if (data.secrets?.length > 10) data.secrets = data.secrets.slice(0, 10);
+      if (data.quickSubs?.length > 40) data.quickSubs = data.quickSubs.slice(0, 40);
+      if (data.aiEnhancedSubs?.length > 30) data.aiEnhancedSubs = data.aiEnhancedSubs.slice(0, 30);
+      try { await chrome.storage.session.set({ [`tab:${tabId}`]: data }); } catch (e2) { logError(`Storage set still failed after pruning:`, e2); }
+    } else {
+      logError(`Failed to set tab data for ${tabId}:`, e);
+    }
+  }
+}
+const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
+// Proper mutex: each key has a chain of promises; new callers always
+// append to the tail, guaranteeing serialised execution without TOCTOU gaps.
+const patchQueues = new Map();
+async function patchState(tabId, patch){
+  const key = `tab:${tabId}`;
+  const prev = patchQueues.get(key) || Promise.resolve();
+  let releaseLock;
+  const gate = new Promise(r => { releaseLock = r; });
+  // Atomically replace the tail with our gate *before* awaiting
+  patchQueues.set(key, gate);
+  try {
+    await prev; // wait for preceding patch to finish
     const cur = await getTabData(tabId) || {};
     const next = merge(cur, patch);
     await setTabData(tabId, next);
     return next;
   } finally {
-    patchLocks.delete(key);
-    resolve();
+    // If this was the last in the chain, clean up the key
+    if (patchQueues.get(key) === gate) patchQueues.delete(key);
+    releaseLock();
   }
 }
 
@@ -1717,11 +1748,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   headersByTab.delete(tabId);
   resourcesByTab.delete(tabId);
   scannedByTab.delete(tabId);
-  patchLocks.delete(`tab:${tabId}`);
+  patchQueues.delete(`tab:${tabId}`);
   if (highlightTimers.has(tabId)) {
     clearTimeout(highlightTimers.get(tabId));
     highlightTimers.delete(tabId);
   }
-  chrome.storage.session.remove(`tab:${tabId}`).catch(() => {});
+  chrome.storage.session.remove(`tab:${tabId}`).catch(e => logError(`Failed to clean session for tab ${tabId}:`, e));
   log(`Cleaned up data for closed tab ${tabId}`);
 });

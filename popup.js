@@ -232,15 +232,29 @@ function aiCorrelationCard(s){
     card.appendChild(el('<div class="small">AI analysis running in background... (requires OpenAI API key in Options)</div>'));
     return card;
   }
-  // Parse markdown and display using insertAdjacentHTML to avoid re-parsing existing children
-  const content = s.aiCorrelation.split('\n').map(line => {
-    if(line.startsWith('###')) return `<h4 style="margin:8px 0 4px 0;font-size:11px">${esc(line.replace(/^###\s*/,''))}</h4>`;
-    if(line.startsWith('##')) return `<h4 style="margin:10px 0 6px 0;font-size:12px;font-weight:bold">${esc(line.replace(/^##\s*/,''))}</h4>`;
-    if(line.startsWith('- ')) return `<div class="small" style="margin-left:12px">• ${esc(line.replace(/^-\s*/,''))}</div>`;
-    if(line.trim()) return `<div class="small">${esc(line)}</div>`;
-    return '';
-  }).join('');
-  card.insertAdjacentHTML('beforeend', content);
+  // Parse markdown lines into safe DOM elements (no innerHTML/insertAdjacentHTML)
+  for (const line of s.aiCorrelation.split('\n')) {
+    let node;
+    if (line.startsWith('###')) {
+      node = document.createElement('h4');
+      node.style.cssText = 'margin:8px 0 4px 0;font-size:11px';
+      node.textContent = line.replace(/^###\s*/, '');
+    } else if (line.startsWith('##')) {
+      node = document.createElement('h4');
+      node.style.cssText = 'margin:10px 0 6px 0;font-size:12px;font-weight:bold';
+      node.textContent = line.replace(/^##\s*/, '');
+    } else if (line.startsWith('- ')) {
+      node = document.createElement('div');
+      node.className = 'small';
+      node.style.marginLeft = '12px';
+      node.textContent = '\u2022 ' + line.replace(/^-\s*/, '');
+    } else if (line.trim()) {
+      node = document.createElement('div');
+      node.className = 'small';
+      node.textContent = line;
+    }
+    if (node) card.appendChild(node);
+  }
   return card;
 }
 
