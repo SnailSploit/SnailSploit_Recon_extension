@@ -598,7 +598,7 @@ function extractIntelFromText(html) {
   if (phones) phones.filter(p => p.replace(/\D/g, '').length >= 7).forEach(p => intel.phones.add(p));
 
   // Social media links (updated: includes x.com, tiktok, mastodon, threads)
-  const socialRx = /(https?:\/\/)?(www\.)?(twitter|x|linkedin|facebook|github|instagram|youtube|tiktok|mastodon\.social|threads\.net)\.com\/[A-Za-z0-9_\-\.\/]+/gi;
+  const socialRx = /https?:\/\/(?:www\.)?(?:twitter\.com|x\.com|linkedin\.com|facebook\.com|github\.com|instagram\.com|youtube\.com|tiktok\.com|mastodon\.social|threads\.net)\/[@A-Za-z0-9_\-\.\/]+/gi;
   const social = html.match(socialRx);
   if (social) social.forEach(s => intel.socialLinks.add(s));
 
