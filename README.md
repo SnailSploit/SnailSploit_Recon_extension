@@ -1,23 +1,9 @@
 
 <div align="center">
 
-```
-   ____              _ _ ____        _       _ _
-  / ___| _ __   __ _(_) / ___| _ __ | | ___ (_) |_
-  \___ \| '_ \ / _` | | \___ \| '_ \| |/ _ \| | __|
-   ___) | | | | (_| | | |___) | |_) | | (_) | | |_
-  |____/|_| |_|\__,_|_|_|____/| .__/|_|\___/|_|\__|
-                               |_|
-   ____
-  |  _ \ ___  ___ ___  _ __
-  | |_) / _ \/ __/ _ \| '_ \
-  |  _ <  __/ (_| (_) | | | |
-  |_| \_\___|\___\___/|_| |_|
-```
+<img src="banner.png" alt="SnailSploit Recon" width="900" />
 
 # 🐌 SnailSploit Recon Extension
-
-### *Slow shell. Fast recon. Zero clicks.*
 
 [![Chrome MV3](https://img.shields.io/badge/Chrome-MV3-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/mv3/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
