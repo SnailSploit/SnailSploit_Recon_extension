@@ -25,7 +25,9 @@ function headerCard(s){
 }
 
 function timeSince(ts) {
+  if (!ts || typeof ts !== "number") return "";
   const s = Math.floor((Date.now() - ts) / 1000);
+  if (isNaN(s) || s < 0) return "";
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s/60)}m ago`;
   if (s < 86400) return `${Math.floor(s/3600)}h ago`;
@@ -168,7 +170,7 @@ function securityChecksCard(s){
   if(s.corsFindings && s.corsFindings.length > 0){
     const corsHTML = s.corsFindings.map(c => {
       const severity = c.credentials ? 'critical' : 'high';
-      return `<div class="row" style="margin:4px 0"><span class="chip" style="${severityStyle(severity)}">${c.type.toUpperCase()}</span> <span class="small">${esc(c.detail)}</span></div>`;
+      return `<div class="row" style="margin:4px 0"><span class="chip" style="${severityStyle(severity)}">${(c.type||"cors").toUpperCase()}</span> <span class="small">${esc(c.detail)}</span></div>`;
     }).join('');
     card.appendChild(el(`<div><b>CORS Issues:</b>${corsHTML}</div>`));
   }
@@ -306,7 +308,13 @@ function aiEnhancedSubsCard(s){
 function copyBtn(text, label="Copy") {
   const b = document.createElement("button");
   b.className = "btn"; b.textContent = label; b.style.cssText = "font-size:10px;padding:2px 6px;margin-left:4px";
-  b.addEventListener("click", () => { navigator.clipboard.writeText(text); b.textContent = "Copied!"; setTimeout(() => b.textContent = label, 1200); });
+  let timer = null;
+  b.addEventListener("click", () => {
+    if (timer) clearTimeout(timer);
+    navigator.clipboard.writeText(text).catch(() => {});
+    b.textContent = "Copied!";
+    timer = setTimeout(() => { b.textContent = label; timer = null; }, 1200);
+  });
   return b;
 }
 
@@ -317,10 +325,12 @@ function collapsible(title, contentFn, startOpen=true) {
   body.style.display = startOpen ? "block" : "none";
   contentFn(body);
   card.appendChild(body);
-  card.querySelector(".collapsible-toggle").addEventListener("click", () => {
+  const toggle = card.querySelector(".collapsible-toggle");
+  if (toggle) toggle.addEventListener("click", () => {
     const open = body.style.display !== "none";
     body.style.display = open ? "none" : "block";
-    card.querySelector(".collapsible-toggle span").textContent = open ? "▶" : "▼";
+    const arrow = toggle.querySelector("span");
+    if (arrow) arrow.textContent = open ? "▶" : "▼";
   });
   return card;
 }
@@ -456,7 +466,27 @@ function paramsCard(s) {
       const d = document.createElement("div");
       d.className = "small";
       d.style.cssText = `margin:2px 0;padding:2px 4px;border-radius:3px;${hot ? "background:#fff3e0;border-left:2px solid #fb8c00" : ""}`;
-      d.innerHTML = `<code>${esc(p.name)}</code>${hot ? ' <span style="color:#e65100;font-size:9px">⚡ HIGH INTEREST</span>' : ''} ${p.examples.length ? `<span class="small"> e.g. ${p.examples.slice(0,2).map(v=>`<code>${esc(v)}</code>`).join(", ")}</span>` : ""}`;
+      const nameCode = document.createElement("code");
+      nameCode.textContent = p.name;
+      d.appendChild(nameCode);
+      if (hot) {
+        const badge = document.createElement("span");
+        badge.style.cssText = "color:#e65100;font-size:9px;margin-left:4px";
+        badge.textContent = "HIGH INTEREST";
+        d.appendChild(badge);
+      }
+      if (p.examples?.length) {
+        const eg = document.createElement("span");
+        eg.className = "small";
+        eg.textContent = " e.g. ";
+        d.appendChild(eg);
+        p.examples.slice(0, 2).forEach((v, i) => {
+          if (i > 0) d.appendChild(document.createTextNode(", "));
+          const c = document.createElement("code");
+          c.textContent = v;
+          d.appendChild(c);
+        });
+      }
       body.appendChild(d);
     }
   }, false);
@@ -524,10 +554,26 @@ function requestLogCard(s) {
       const d = document.createElement("div");
       d.className = "small mono";
       d.style.cssText = "margin:2px 0;display:flex;gap:6px;align-items:center";
-      d.innerHTML = `<span style="color:${statusColor};min-width:24px">${r.status || "?"}</span>
-        <b style="min-width:34px">${esc(r.method)}</b>
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.url)}">${esc(r.path)}</span>
-        ${r.params?.length ? `<span class="chip" style="font-size:9px">${r.params.length} params</span>` : ""}`;
+      const st = document.createElement("span");
+      st.style.cssText = `color:${statusColor};min-width:24px`;
+      st.textContent = r.status || "?";
+      const meth = document.createElement("b");
+      meth.style.minWidth = "34px";
+      meth.textContent = r.method || "?";
+      const pathEl = document.createElement("span");
+      pathEl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      pathEl.title = r.url || "";
+      pathEl.textContent = r.path || "";
+      d.appendChild(st);
+      d.appendChild(meth);
+      d.appendChild(pathEl);
+      if (r.params?.length) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.style.fontSize = "9px";
+        chip.textContent = `${r.params.length} params`;
+        d.appendChild(chip);
+      }
       body.appendChild(d);
     }
   }, false);
@@ -535,6 +581,8 @@ function requestLogCard(s) {
 
 async function render(){
   const root=document.getElementById("root");
+  if (!root) return;
+  try {
   // Preserve scroll position across re-renders
   const scrollY = root.parentElement?.scrollTop || 0;
   const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
@@ -609,7 +657,11 @@ async function render(){
   root.appendChild(exportCard(s));
 
   // Restore scroll position
-  if (scrollY) requestAnimationFrame(() => { root.parentElement.scrollTop = scrollY; });
+  if (scrollY > 0) requestAnimationFrame(() => { if (root.parentElement) root.parentElement.scrollTop = scrollY; });
+  } catch (err) {
+    if (root) root.textContent = "Connection error. Try reloading the page.";
+    console.error("Render failed:", err);
+  }
 }
 
 function externalToolsCard(s){
@@ -883,6 +935,7 @@ function debouncedRender() {
   if (renderTimer) clearTimeout(renderTimer);
   renderTimer = setTimeout(() => { renderTimer = null; render(); }, 250);
 }
+window.addEventListener("unload", () => { if (renderTimer) clearTimeout(renderTimer); });
 
 (async()=>{
   TAB_ID=await getTabId();

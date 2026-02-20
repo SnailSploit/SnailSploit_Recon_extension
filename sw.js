@@ -954,6 +954,7 @@ async function checkSubdomainTakeover(subdomain, cnames) {
 
 // Extract API endpoints, routes, and interesting URLs from JavaScript source
 function extractJSEndpoints(jsText) {
+  if (!jsText) return [];
   const endpoints = new Set();
   const apiPatterns = [
     // Fetch/XHR calls: fetch("/api/users"), axios.get("/v1/data")
@@ -1040,7 +1041,8 @@ function detectAuthSurfaces(forms, urls, html) {
     if (/accounts\.google\.com|googleapis\.com\/auth/i.test(html)) surfaces.push({ type: "oauth", detail: "Google OAuth", risk: "medium", why: "Test OAuth misconfiguration, redirect_uri manipulation" });
     if (/graph\.facebook\.com|facebook\.com\/v\d+/i.test(html)) surfaces.push({ type: "oauth", detail: "Facebook Login", risk: "medium", why: "Test OAuth state parameter, CSRF in OAuth flow" });
     if (/github\.com\/login\/oauth/i.test(html)) surfaces.push({ type: "oauth", detail: "GitHub OAuth", risk: "medium", why: "Test scope escalation, token leakage" });
-    if (/cognito|auth0|okta|keycloak/i.test(html)) surfaces.push({ type: "sso", detail: html.match(/cognito|auth0|okta|keycloak/i)[0], risk: "medium", why: "Centralised auth provider - check for misconfig, token reuse" });
+    const ssoMatch = html.match(/cognito|auth0|okta|keycloak/i);
+    if (ssoMatch) surfaces.push({ type: "sso", detail: ssoMatch[0], risk: "medium", why: "Centralised auth provider - check for misconfig, token reuse" });
   }
 
   return surfaces.slice(0, 15);
@@ -1048,6 +1050,7 @@ function detectAuthSurfaces(forms, urls, html) {
 
 // Extract hardcoded configs, debug flags, and interesting JS globals
 function extractJSConfigs(jsText) {
+  if (!jsText) return [];
   const configs = [];
   const patterns = [
     { rx: /(?:debug|DEBUG|verbose|VERBOSE)\s*[:=]\s*(true|1|"true")/g, type: "debug_flag", why: "Debug mode enabled - may expose stack traces, verbose errors" },
@@ -1150,8 +1153,8 @@ function generateLeads(state) {
   }
 
   // Lead 9: Dangerous HTTP methods
-  if (state.httpMethods?.risky) {
-    leads.push({ priority: 3, category: "HTTP Methods", title: `Dangerous methods: ${state.httpMethods.dangerous.join(", ")}`, detail: "PUT/DELETE may allow file upload or resource modification. Test with curl.", action: `curl -X PUT ${state.url}/test.txt -d "pwned"` });
+  if (state.httpMethods?.risky && Array.isArray(state.httpMethods.dangerous) && state.httpMethods.dangerous.length) {
+    leads.push({ priority: 3, category: "HTTP Methods", title: `Dangerous methods: ${state.httpMethods.dangerous.join(", ")}`, detail: "PUT/DELETE may allow file upload or resource modification. Test with curl.", action: `curl -X PUT ${state.url || "TARGET"}/test.txt -d "pwned"` });
   }
 
   // Lead 10: Missing security headers → XSS potential
@@ -1161,7 +1164,7 @@ function generateLeads(state) {
   }
 
   // Lead 11: Insecure cookies
-  if (state.cookieSecurity?.some(c => c.issues.length > 0 && !c.httpOnly)) {
+  if (Array.isArray(state.cookieSecurity) && state.cookieSecurity.some(c => c.issues?.length > 0 && !c.httpOnly)) {
     const vulnCookies = state.cookieSecurity.filter(c => !c.httpOnly);
     if (vulnCookies.length) {
       leads.push({ priority: 3, category: "Session Hijacking", title: `${vulnCookies.length} cookies accessible via JavaScript`, detail: `Cookies without HttpOnly: ${vulnCookies.map(c => c.name).join(", ")}. If XSS exists, these can be stolen.`, action: "document.cookie" });
@@ -1187,6 +1190,7 @@ function analyzeForms(html) {
 
     const inputs = [];
     let inputMatch;
+    inputRx.lastIndex = 0;
     while ((inputMatch = inputRx.exec(formHTML)) !== null) {
       const inputHTML = inputMatch[0];
       const type = (inputHTML.match(/type=["']([^"']+)["']/i) || [])[1] || 'text';
@@ -2074,7 +2078,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             } catch (e) {
               logError("JS deep analysis failed:", e);
             }
-          })();
+          })().catch(e => logError("JS deep analysis unhandled:", e));
         }
         sendResponse({ ok: true });
       } else if (msg?.type === "getState") {
