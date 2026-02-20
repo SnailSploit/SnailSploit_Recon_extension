@@ -44,6 +44,7 @@
     chrome.runtime.sendMessage({
       type: "pageResources",
       url: location.href,
+      pageTitle: document.title || null,
       externalScripts: Array.from(state.external).slice(0, 100),
       inlineScripts: state.inline.slice(0, 16),
       favicon: state.favicon,

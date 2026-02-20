@@ -27,7 +27,10 @@ const CONFIG = {
     MAX_CVE_RESULTS: 60,
     MAX_SOURCE_MAPS: 6,
     MAX_DKIM_SELECTORS: 6,
-    MAX_DOM_PATHS: 200
+    MAX_DOM_PATHS: 200,
+    MAX_PAGES_TRACKED: 100,
+    MAX_REQUESTS_LOGGED: 200,
+    MAX_DOMAIN_STORE_SIZE: 500000 // ~500KB per domain
   },
   RETRY: {
     MAX_ATTEMPTS: 3,
@@ -58,6 +61,175 @@ function merge(a, b) {
 const dohCache = new Map();
 const subdomainCache = new Map();
 const highlightTimers = new Map();
+
+// ============ DOMAIN-LEVEL PERSISTENT STORE ============
+// Accumulates findings across pages, tabs, and sessions for a target domain.
+// While tab state (session storage) shows the current page, domain state
+// (local storage) builds a complete picture as the user browses.
+
+const domainStoreKey = (domain) => `domain:${domain}`;
+
+async function getDomainData(domain) {
+  try {
+    const key = domainStoreKey(domain);
+    return (await chrome.storage.local.get(key))[key] || null;
+  } catch (e) { logError("getDomainData failed:", e); return null; }
+}
+
+async function setDomainData(domain, data) {
+  try {
+    const key = domainStoreKey(domain);
+    data._lastUpdated = Date.now();
+    await chrome.storage.local.set({ [key]: data });
+  } catch (e) {
+    if (String(e).includes('QUOTA') || String(e).includes('quota')) {
+      // Prune oldest domain stores to make room
+      const all = await chrome.storage.local.get(null);
+      const domains = Object.entries(all)
+        .filter(([k]) => k.startsWith("domain:"))
+        .sort(([,a],[,b]) => (a._lastUpdated||0) - (b._lastUpdated||0));
+      if (domains.length > 5) {
+        await chrome.storage.local.remove(domains.slice(0, 3).map(([k]) => k));
+        log("Pruned 3 oldest domain stores for quota");
+        try { await chrome.storage.local.set({ [domainStoreKey(domain)]: data }); } catch {}
+      }
+    } else { logError("setDomainData failed:", e); }
+  }
+}
+
+// Merge new findings into the domain's persistent store.
+// Arrays are union-merged (deduplicated), objects are deep-merged.
+function mergeUnique(existing, incoming, keyFn) {
+  if (!existing || !existing.length) return incoming || [];
+  if (!incoming || !incoming.length) return existing;
+  const seen = new Set(existing.map(keyFn).filter(Boolean));
+  const merged = [...existing];
+  for (const item of incoming) {
+    const k = keyFn(item);
+    if (k && !seen.has(k)) { seen.add(k); merged.push(item); }
+  }
+  return merged;
+}
+
+async function accumulateToDomain(domain, tabState) {
+  if (!domain || !tabState) return;
+  const existing = await getDomainData(domain) || {
+    domain,
+    firstSeen: Date.now(),
+    pagesVisited: [],
+    requestLog: [],
+    allEndpoints: [],
+    allParams: [],
+    allSecrets: [],
+    allEmails: [],
+    allForms: [],
+    allTech: [],
+    allCookies: [],
+    jsEndpoints: [],
+    authSurfaces: [],
+    jsConfigs: [],
+    subdomainTakeovers: [],
+    waybackUrls: [],
+    waybackAll: [],
+    discoveredParams: [],
+    leads: []
+  };
+
+  // Track page visit
+  const page = tabState.url;
+  if (page && !existing.pagesVisited.some(p => p.url === page)) {
+    existing.pagesVisited.push({
+      url: page,
+      ts: Date.now(),
+      title: tabState.pageTitle || null
+    });
+    if (existing.pagesVisited.length > CONFIG.LIMITS.MAX_PAGES_TRACKED) {
+      existing.pagesVisited = existing.pagesVisited.slice(-CONFIG.LIMITS.MAX_PAGES_TRACKED);
+    }
+  }
+
+  // Accumulate secrets (deduplicate by source)
+  existing.allSecrets = mergeUnique(existing.allSecrets, tabState.secrets, s => s.source);
+
+  // Accumulate subdomains
+  existing.quickSubs = mergeUnique(existing.quickSubs, tabState.quickSubs, s => s?.subdomain);
+
+  // Accumulate JS endpoints
+  if (tabState.jsEndpoints?.length) {
+    const epSet = new Set(existing.jsEndpoints || []);
+    for (const ep of tabState.jsEndpoints) epSet.add(ep);
+    existing.jsEndpoints = [...epSet].slice(0, 500);
+  }
+
+  // Accumulate auth surfaces
+  existing.authSurfaces = mergeUnique(existing.authSurfaces, tabState.authSurfaces, a => `${a.type}:${a.detail}`);
+
+  // Accumulate JS configs
+  existing.jsConfigs = mergeUnique(existing.jsConfigs, tabState.jsConfigs, c => c.match);
+
+  // Accumulate emails
+  if (tabState.intel?.emails?.length) {
+    const emailSet = new Set(existing.allEmails || []);
+    for (const e of tabState.intel.emails) emailSet.add(e);
+    existing.allEmails = [...emailSet];
+  }
+
+  // Accumulate forms (deduplicate by action+method)
+  existing.allForms = mergeUnique(existing.allForms, tabState.forms, f => `${f.method}:${f.action}`);
+
+  // Accumulate tech tags
+  if (tabState.tech?.tags) {
+    const techSet = new Set(existing.allTech || []);
+    for (const t of tabState.tech.tags) techSet.add(t);
+    existing.allTech = [...techSet];
+  }
+
+  // Accumulate cookies
+  existing.allCookies = mergeUnique(existing.allCookies, tabState.cookieSecurity, c => c.name);
+
+  // Accumulate takeovers
+  existing.subdomainTakeovers = mergeUnique(
+    existing.subdomainTakeovers, tabState.subdomainTakeovers, t => t.subdomain
+  );
+
+  // Accumulate wayback URLs
+  if (tabState.waybackUrls?.length) {
+    const wbSet = new Set(existing.waybackUrls || []);
+    for (const u of tabState.waybackUrls) wbSet.add(u);
+    existing.waybackUrls = [...wbSet].slice(0, 200);
+  }
+
+  // Accumulate discovered params
+  existing.discoveredParams = mergeUnique(
+    existing.discoveredParams, tabState.discoveredParams, p => p.name
+  );
+
+  // Copy over one-time fields (latest wins)
+  if (tabState.headers) existing.headers = tabState.headers;
+  if (tabState.ips) existing.ips = tabState.ips;
+  if (tabState.perIp) existing.perIp = merge(existing.perIp || {}, tabState.perIp);
+  if (tabState.tlsInfo) existing.tlsInfo = tabState.tlsInfo;
+  if (tabState.corsFindings) existing.corsFindings = tabState.corsFindings;
+  if (tabState.sensitiveFiles) existing.sensitiveFiles = tabState.sensitiveFiles;
+  if (tabState.httpMethods) existing.httpMethods = tabState.httpMethods;
+  if (tabState.dmarc) existing.dmarc = tabState.dmarc;
+  if (tabState.spf) existing.spf = tabState.spf;
+  if (tabState.waf) existing.waf = tabState.waf;
+
+  // Re-generate leads from accumulated data
+  existing.leads = generateLeads(existing);
+
+  // Stats
+  existing.totalPages = existing.pagesVisited.length;
+  existing.totalEndpoints = (existing.jsEndpoints || []).length;
+  existing.totalSecrets = (existing.allSecrets || []).length;
+
+  await setDomainData(domain, existing);
+  return existing;
+}
+
+// Track tab → domain mapping so we know which domain each tab is on
+const tabDomainMap = new Map();
 function setBoundedCache(map, key, value){
   map.set(key, value);
   if (map.size > CONFIG.CACHE.MAX_ENTRIES) {
@@ -99,6 +271,63 @@ chrome.webRequest.onHeadersReceived.addListener((d)=>{
   if (d.type !== "main_frame") return;
   headersByTab.set(d.tabId, { url: d.url, responseHeaders: d.responseHeaders || [] });
 }, { urls: ["<all_urls>"] }, ["responseHeaders","extraHeaders"]);
+
+// Passive request logger - captures API calls, XHR, fetches as user browses
+const requestLogByDomain = new Map();
+chrome.webRequest.onCompleted.addListener((d) => {
+  if (d.tabId < 0) return; // Ignore non-tab requests
+  const domain = tabDomainMap.get(d.tabId);
+  if (!domain) return;
+
+  // Only log interesting request types (skip images, fonts, CSS)
+  const dominated = ["xmlhttprequest", "script", "sub_frame", "other"];
+  if (!dominated.includes(d.type)) return;
+
+  try {
+    const urlObj = new URL(d.url);
+    const entry = {
+      url: d.url,
+      path: urlObj.pathname,
+      method: d.method || "GET",
+      type: d.type,
+      status: d.statusCode,
+      ts: Date.now()
+    };
+
+    // Extract query parameters
+    if (urlObj.search) {
+      entry.params = [...urlObj.searchParams.keys()].slice(0, 20);
+    }
+
+    if (!requestLogByDomain.has(domain)) requestLogByDomain.set(domain, []);
+    const log_arr = requestLogByDomain.get(domain);
+    // Deduplicate by path+method
+    if (!log_arr.some(e => e.path === entry.path && e.method === entry.method)) {
+      log_arr.push(entry);
+      if (log_arr.length > CONFIG.LIMITS.MAX_REQUESTS_LOGGED) log_arr.shift();
+    }
+  } catch {}
+}, { urls: ["<all_urls>"] });
+
+// Also capture redirects passively
+chrome.webRequest.onBeforeRedirect.addListener((d) => {
+  if (d.tabId < 0) return;
+  const domain = tabDomainMap.get(d.tabId);
+  if (!domain) return;
+  try {
+    if (!requestLogByDomain.has(domain)) requestLogByDomain.set(domain, []);
+    const log_arr = requestLogByDomain.get(domain);
+    log_arr.push({
+      url: d.url,
+      redirectUrl: d.redirectUrl,
+      method: d.method || "GET",
+      type: "redirect",
+      status: d.statusCode,
+      ts: Date.now()
+    });
+    if (log_arr.length > CONFIG.LIMITS.MAX_REQUESTS_LOGGED) log_arr.shift();
+  } catch {}
+}, { urls: ["<all_urls>"] });
 
 function pickSecurityHeaders(tabId){
   const rec = headersByTab.get(tabId); if (!rec) return null;
@@ -1746,6 +1975,9 @@ function scheduleHighlights(tabId){
       if(highlights) await patchState(tabId, { highlights });
       // Also refresh leads with latest data
       await refreshLeads(tabId);
+      // Accumulate findings into persistent domain store
+      const domain = tabDomainMap.get(tabId) || state?.domain;
+      if (domain) accumulateToDomain(domain, state).catch(e => logError("Domain accumulation failed:", e));
     }catch(e){ logError("Highlight generation failed", e); }
   }, 400);
   highlightTimers.set(tabId, timer);
@@ -1760,6 +1992,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         resourcesByTab.set(sender.tab.id, msg);
         const base = await getTabData(sender.tab.id);
         if (base) {
+          // Store page title for browsing breadcrumb trail
+          if (msg.pageTitle) await patchState(sender.tab.id, { pageTitle: msg.pageTitle });
           try {
             const fav = base.faviconHash;
             const tech = detectTech({ headers: base.headers || {}, meta: msg.meta || {}, domHints: msg.domHints || {}, faviconHash: fav });
@@ -1844,7 +2078,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         sendResponse({ ok: true });
       } else if (msg?.type === "getState") {
-        sendResponse(await getTabData(msg.tabId));
+        const tabData = await getTabData(msg.tabId);
+        // Attach domain stats for the popup to show
+        if (tabData?.domain) {
+          const domData = await getDomainData(tabData.domain);
+          if (domData) {
+            tabData._domainStats = {
+              totalPages: domData.pagesVisited?.length || 0,
+              totalEndpoints: domData.jsEndpoints?.length || 0,
+              totalSecrets: domData.allSecrets?.length || 0,
+              totalEmails: domData.allEmails?.length || 0,
+              totalForms: domData.allForms?.length || 0,
+              totalTech: domData.allTech?.length || 0,
+              firstSeen: domData.firstSeen,
+              pagesVisited: (domData.pagesVisited || []).slice(-20)
+            };
+            // Include request log
+            const reqLog = requestLogByDomain.get(tabData.domain) || [];
+            tabData._requestLog = reqLog.slice(-50);
+          }
+        }
+        sendResponse(tabData);
+      } else if (msg?.type === "getDomainState") {
+        // Full domain accumulated state for deep inspection
+        sendResponse(await getDomainData(msg.domain));
       } else if (msg?.type === "vtSubdomain") {
         const { sub } = msg;
         const state = await getTabData(msg.tabId);
@@ -1876,10 +2133,32 @@ async function analyze(tabId, url){
     const u=new URL(url); if(!/^https?:$/.test(u.protocol)) return;
     const domain=u.hostname;
 
+    // Track which domain this tab is browsing
+    tabDomainMap.set(tabId, domain);
+
     let hdrSnap = pickSecurityHeaders(tabId);
     if(!hdrSnap){ try{ const h=await fetchHeadersFallback(url); if(h) hdrSnap={url, headers:h}; }catch{} }
 
-    await setTabData(tabId, { url, domain, headers: hdrSnap?hdrSnap.headers:{}, ts: Date.now() });
+    // Load existing domain data to preserve cross-page accumulation
+    const domainData = await getDomainData(domain);
+    const preserved = {};
+    if (domainData) {
+      // Carry forward accumulated fields so they're visible in tab view
+      if (domainData.jsEndpoints?.length) preserved.jsEndpoints = domainData.jsEndpoints;
+      if (domainData.authSurfaces?.length) preserved.authSurfaces = domainData.authSurfaces;
+      if (domainData.leads?.length) preserved.leads = domainData.leads;
+      if (domainData.waybackUrls?.length) preserved.waybackUrls = domainData.waybackUrls;
+      if (domainData.subdomainTakeovers?.length) preserved.subdomainTakeovers = domainData.subdomainTakeovers;
+      if (domainData.discoveredParams?.length) preserved.discoveredParams = domainData.discoveredParams;
+    }
+
+    await setTabData(tabId, {
+      url, domain,
+      headers: hdrSnap ? hdrSnap.headers : {},
+      ts: Date.now(),
+      pageTitle: null,
+      ...preserved
+    });
     scheduleHighlights(tabId);
 
     // IPs - Resolve and enrich with all available data

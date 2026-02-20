@@ -6,7 +6,30 @@ function esc(s){ return (s??"").toString().replace(/[&<>"']/g,c=>({"&":"&amp;","
 
 function headerCard(s){
   const fav = (typeof s.faviconHash==="number") ? `<span class="small">favicon mmh3: <code>${s.faviconHash}</code></span>` : "";
-  return el(`<div class="card"><div><b>${esc(s.domain||"")}</b><div class="small">${esc(s.url||"")}</div>${fav}</div></div>`);
+
+  // Domain accumulation stats
+  const ds = s._domainStats;
+  let statsHtml = "";
+  if (ds) {
+    const elapsed = ds.firstSeen ? timeSince(ds.firstSeen) : "";
+    statsHtml = `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+      <span class="chip" style="background:#e3f2fd;border-color:#1976d2;color:#0d47a1" title="Pages browsed on this domain">${ds.totalPages} pages</span>
+      <span class="chip" style="background:#e8f5e9;border-color:#4caf50;color:#2e7d32" title="JS endpoints extracted">${ds.totalEndpoints} endpoints</span>
+      <span class="chip" style="background:#fff3e0;border-color:#fb8c00;color:#e65100" title="Secrets flagged">${ds.totalSecrets} secrets</span>
+      ${ds.totalEmails ? `<span class="chip">${ds.totalEmails} emails</span>` : ""}
+      ${elapsed ? `<span class="chip small" title="Tracking since first visit">${elapsed}</span>` : ""}
+    </div>`;
+  }
+
+  return el(`<div class="card"><div><b>${esc(s.domain||"")}</b><div class="small">${esc(s.url||"")}</div>${fav}${statsHtml}</div></div>`);
+}
+
+function timeSince(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
 }
 function severityStyle(level){
   const map={
@@ -461,6 +484,55 @@ function authCard(s) {
   });
 }
 
+// Pages visited breadcrumb trail
+function pagesVisitedCard(s) {
+  const pages = s._domainStats?.pagesVisited;
+  if (!pages || pages.length < 2) return null;
+  return collapsible(`📍 Pages Browsed (${pages.length})`, body => {
+    for (const p of [...pages].reverse().slice(0, 20)) {
+      const ago = timeSince(p.ts);
+      const path = p.url.replace(/https?:\/\/[^\/]+/, "") || "/";
+      const d = document.createElement("div");
+      d.className = "small";
+      d.style.cssText = "margin:2px 0;display:flex;justify-content:space-between;gap:8px";
+      const pathSpan = document.createElement("span");
+      pathSpan.className = "mono";
+      pathSpan.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px";
+      pathSpan.textContent = path;
+      pathSpan.title = p.url;
+      const timeSpan = document.createElement("span");
+      timeSpan.style.cssText = "opacity:0.5;white-space:nowrap";
+      timeSpan.textContent = ago;
+      d.appendChild(pathSpan);
+      d.appendChild(timeSpan);
+      body.appendChild(d);
+    }
+  }, false);
+}
+
+// Passive request log card
+function requestLogCard(s) {
+  const reqs = s._requestLog;
+  if (!reqs || reqs.length < 3) return null;
+  const apiReqs = reqs.filter(r => /xmlhttprequest/i.test(r.type) || /\/api|\/v\d|graphql/i.test(r.path));
+  if (!apiReqs.length) return null;
+  return collapsible(`📡 API Calls Observed (${apiReqs.length})`, body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">Passively captured as you browsed</div>`));
+    body.appendChild(copyBtn(apiReqs.map(r => `${r.method} ${r.path}`).join("\n"), "Copy All"));
+    for (const r of apiReqs.slice(-30).reverse()) {
+      const statusColor = r.status >= 400 ? "#b71c1c" : r.status >= 300 ? "#e65100" : "#2e7d32";
+      const d = document.createElement("div");
+      d.className = "small mono";
+      d.style.cssText = "margin:2px 0;display:flex;gap:6px;align-items:center";
+      d.innerHTML = `<span style="color:${statusColor};min-width:24px">${r.status || "?"}</span>
+        <b style="min-width:34px">${esc(r.method)}</b>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.url)}">${esc(r.path)}</span>
+        ${r.params?.length ? `<span class="chip" style="font-size:9px">${r.params.length} params</span>` : ""}`;
+      body.appendChild(d);
+    }
+  }, false);
+}
+
 async function render(){
   const root=document.getElementById("root");
   // Preserve scroll position across re-renders
@@ -527,6 +599,12 @@ async function render(){
 
   root.appendChild(subsCard(s));
   if(s.aiEnhancedSubs && s.aiEnhancedSubs.length > 0) root.appendChild(aiEnhancedSubsCard(s));
+  // Passive capture cards
+  const reqCard = requestLogCard(s);
+  if (reqCard) root.appendChild(reqCard);
+  const pvCard = pagesVisitedCard(s);
+  if (pvCard) root.appendChild(pvCard);
+
   root.appendChild(externalToolsCard(s));
   root.appendChild(exportCard(s));
 
@@ -783,6 +861,11 @@ function exportCard(s){
     if(s.secrets?.length) report += `\nSecrets Found: ${s.secrets.length} sources\n`;
     if(s.waybackUrls?.length) report += `\nWayback Machine URLs (${s.waybackUrls.length} interesting):\n${s.waybackUrls.join('\n')}\n`;
     if(s.subdomainTakeovers?.length) report += `\nSubdomain Takeovers:\n${s.subdomainTakeovers.map(t=>`${t.subdomain} → ${t.service} (${t.cname})`).join('\n')}\n`;
+    if(s.jsEndpoints?.length) report += `\nJS Endpoints (${s.jsEndpoints.length}):\n${s.jsEndpoints.join('\n')}\n`;
+    if(s.authSurfaces?.length) report += `\nAuth Surfaces:\n${s.authSurfaces.map(a=>`${a.type}: ${a.detail}`).join('\n')}\n`;
+    if(s._requestLog?.length) report += `\nPassive Request Log (${s._requestLog.length}):\n${s._requestLog.map(r=>`${r.method} ${r.status} ${r.url}`).join('\n')}\n`;
+    if(s._domainStats?.pagesVisited?.length) report += `\nPages Browsed (${s._domainStats.pagesVisited.length}):\n${s._domainStats.pagesVisited.map(p=>p.url).join('\n')}\n`;
+    if(s.leads?.length) report += `\nAttack Leads:\n${s.leads.map(l=>`[P${l.priority}] ${l.category}: ${l.title} — ${l.detail}`).join('\n')}\n`;
     const blob = new Blob([report], {type: 'text/plain'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
