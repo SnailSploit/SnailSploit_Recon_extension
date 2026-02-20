@@ -43,7 +43,18 @@ const CONFIG = {
 
 function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
 function logError(...a){ try{ console.error("[SnailSploit Recon ERROR]", ...a);}catch{} }
-const merge = (a,b)=>Object.assign({},a||{},b||{});
+function merge(a, b) {
+  const result = Object.assign({}, a || {});
+  for (const [key, val] of Object.entries(b || {})) {
+    if (val !== null && typeof val === 'object' && !Array.isArray(val) &&
+        result[key] !== null && typeof result[key] === 'object' && !Array.isArray(result[key])) {
+      result[key] = merge(result[key], val);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
 const dohCache = new Map();
 const subdomainCache = new Map();
 const highlightTimers = new Map();
@@ -91,7 +102,14 @@ chrome.webRequest.onHeadersReceived.addListener((d)=>{
 
 function pickSecurityHeaders(tabId){
   const rec = headersByTab.get(tabId); if (!rec) return null;
-  const h = {}; for (const {name,value} of rec.responseHeaders||[]) h[name.toLowerCase()] = value || "";
+  const h = {}; const setCookies = [];
+  for (const {name,value} of rec.responseHeaders||[]) {
+    const lc = name.toLowerCase();
+    if (lc === "set-cookie") { setCookies.push(value || ""); }
+    else { h[lc] = value || ""; }
+  }
+  // Preserve all Set-Cookie headers as an array
+  if (setCookies.length) h["set-cookie"] = setCookies;
   const get = k => h[k] || null;
   return { url: rec.url, headers: {
     "content-security-policy": get("content-security-policy"),
@@ -103,7 +121,8 @@ function pickSecurityHeaders(tabId){
     "server": get("server"),
     "alt-svc": get("alt-svc"),
     "x-powered-by": get("x-powered-by"),
-    "via": get("via")
+    "via": get("via"),
+    "set-cookie": setCookies.length ? setCookies : null
   }};
 }
 async function fetchHeadersFallback(url){
@@ -255,32 +274,20 @@ async function subdomainsPassive(domain){
 
   // Fetch from all sources in parallel for maximum speed
   const sources = await Promise.allSettled([
-    // crt.sh - certificate transparency logs
+    // crt.sh - certificate transparency logs (uses shared cache)
     (async () => {
       try {
         log(`Fetching subdomains from crt.sh for ${q}...`);
-        const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
-        if (r.ok) {
-          const t = await r.text();
-          let arr = [];
-          try {
-            arr = JSON.parse(t);
-          } catch {
-            // Handle NDJSON format
-            arr = t.trim().split("\n").map(x => {
-              try { return JSON.parse(x); } catch { return null; }
-            }).filter(Boolean);
+        const arr = await fetchCrtshData(q);
+        const results = [];
+        for (const row of arr) {
+          const names = String(row.name_value || "").split(/\n+/);
+          for (const n of names) {
+            if (n && n.endsWith(q)) results.push(n.replace(/^\*\./, ""));
           }
-          const results = [];
-          for (const row of arr) {
-            const names = String(row.name_value || "").split(/\n+/);
-            for (const n of names) {
-              if (n && n.endsWith(q)) results.push(n.replace(/^\*\./, ""));
-            }
-          }
-          log(`crt.sh found ${results.length} subdomains`);
-          return results;
         }
+        log(`crt.sh found ${results.length} subdomains`);
+        return results;
       } catch (e) {
         logError(`crt.sh lookup failed for ${q}:`, e);
       }
@@ -370,19 +377,50 @@ function mmh3_32_from_b64(b64){
 // Fetches favicon and computes its mmh3 hash for fingerprinting
 async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
 
-// TLS/SSL Certificate Analysis - Extract certificate details for security assessment
+// Shared crt.sh data cache to avoid duplicate API calls
+const crtshCache = new Map();
+
+async function fetchCrtshData(hostname) {
+  const q = hostname.replace(/^\*\./, "");
+  if (crtshCache.has(q)) return crtshCache.get(q);
+
+  try {
+    log(`Fetching crt.sh data for ${q}...`);
+    const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (!r.ok) { crtshCache.set(q, []); return []; }
+
+    const t = await r.text();
+    let arr = [];
+    try {
+      arr = JSON.parse(t);
+    } catch {
+      arr = t.trim().split("\n").map(x => {
+        try { return JSON.parse(x); } catch { return null; }
+      }).filter(Boolean);
+    }
+    crtshCache.set(q, arr);
+    return arr;
+  } catch (e) {
+    logError(`crt.sh fetch failed for ${q}:`, e);
+    crtshCache.set(q, []);
+    return [];
+  }
+}
+
+// TLS/SSL Certificate Analysis - Extract certificate details from shared crt.sh data
 async function getTLSInfo(hostname) {
   try {
-    log(`Fetching TLS certificate info for ${hostname}...`);
-    // Use crt.sh API to get certificate details
-    const r = await fetchWithTimeout(`https://crt.sh/?q=${encodeURIComponent(hostname)}&output=json`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
-    if (!r.ok) return null;
-
-    const certs = await r.json();
+    log(`Extracting TLS certificate info for ${hostname}...`);
+    const certs = await fetchCrtshData(hostname);
     if (!Array.isArray(certs) || certs.length === 0) return null;
 
-    // Get the most recent cert
-    const latest = certs.sort((a, b) => new Date(b.entry_timestamp) - new Date(a.entry_timestamp))[0];
+    // Get the most recent cert for the exact hostname (not wildcard subdomains)
+    const relevant = certs.filter(c => {
+      const names = String(c.name_value || "").split(/\n+/);
+      return names.some(n => n.trim() === hostname || n.trim() === `*.${hostname}`);
+    });
+    const pool = relevant.length ? relevant : certs;
+    const latest = pool.sort((a, b) => new Date(b.entry_timestamp) - new Date(a.entry_timestamp))[0];
 
     // Parse SANs (Subject Alternative Names) for subdomain intel
     const sans = new Set();
@@ -402,7 +440,7 @@ async function getTLSInfo(hostname) {
       commonName: latest.common_name
     };
   } catch (e) {
-    logError(`TLS info fetch failed for ${hostname}:`, e);
+    logError(`TLS info extraction failed for ${hostname}:`, e);
     return null;
   }
 }
@@ -472,58 +510,71 @@ async function probeHTTPMethods(url) {
 }
 
 // Sensitive File/Directory Probing - Check for exposed sensitive files
+// Uses content-type validation and soft-404 detection to reduce false positives
 async function probeSensitiveFiles(origin) {
   const sensitiveFiles = [
-    '/.git/config',
-    '/.git/HEAD',
-    '/.env',
-    '/.env.local',
-    '/.env.production',
-    '/config.json',
-    '/package.json',
-    '/composer.json',
-    '/web.config',
-    '/.htaccess',
-    '/phpinfo.php',
-    '/server-status',
-    '/admin',
-    '/.well-known/security.txt',
-    '/backup.zip',
-    '/backup.tar.gz',
-    '/database.sql',
-    '/db.sql',
-    '/.DS_Store',
-    '/Dockerfile',
-    '/.dockerignore',
-    '/docker-compose.yml',
-    '/.gitlab-ci.yml',
-    '/.github/workflows',
-    '/swagger.json',
-    '/api-docs',
-    '/graphql',
-    '/.svn/entries'
+    { path: '/.git/config', expectedType: /text|octet-stream/, marker: '[core]' },
+    { path: '/.git/HEAD', expectedType: /text|octet-stream/, marker: 'ref:' },
+    { path: '/.env', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/.env.local', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/.env.production', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/package.json', expectedType: /json/, marker: '"name"' },
+    { path: '/composer.json', expectedType: /json/, marker: '"require"' },
+    { path: '/web.config', expectedType: /xml|text/, marker: '<configuration' },
+    { path: '/.htaccess', expectedType: /text|octet-stream/, marker: null },
+    { path: '/phpinfo.php', expectedType: /html/, marker: 'phpinfo' },
+    { path: '/server-status', expectedType: /html|text/, marker: 'Apache' },
+    { path: '/backup.zip', expectedType: /zip|octet-stream/, marker: null },
+    { path: '/database.sql', expectedType: /sql|text|octet-stream/, marker: null },
+    { path: '/.DS_Store', expectedType: /octet-stream/, marker: null },
+    { path: '/Dockerfile', expectedType: /text|octet-stream/, marker: 'FROM' },
+    { path: '/docker-compose.yml', expectedType: /yaml|text|octet-stream/, marker: 'services' },
+    { path: '/swagger.json', expectedType: /json/, marker: '"swagger"' },
+    { path: '/graphql', expectedType: /json|html/, marker: null },
+    { path: '/.svn/entries', expectedType: /text|xml|octet-stream/, marker: null }
   ];
 
   const found = [];
-  const checks = sensitiveFiles.slice(0, 25).map(async (path) => {
-    try {
-      const url = new URL(path, origin).href;
-      const r = await fetchWithTimeout(url, { method: 'HEAD' }, 2000);
+  // Rate-limited: batch in groups of 5 with small delay to avoid WAF triggers
+  for (let i = 0; i < sensitiveFiles.length; i += 5) {
+    const batch = sensitiveFiles.slice(i, i + 5);
+    const checks = batch.map(async ({ path, expectedType, marker }) => {
+      try {
+        const url = new URL(path, origin).href;
+        // Use GET with small range to validate content, not just HEAD (which can lie)
+        const r = await fetchWithTimeout(url, { method: 'GET' }, 2500);
 
-      if (r.ok) {
+        if (!r.ok) return;
+
+        const ct = r.headers.get('content-type') || '';
         const size = r.headers.get('content-length');
+
+        // Skip if content-type is HTML for non-HTML expected files (likely a custom 404 page)
+        if (expectedType && !expectedType.test(ct) && /text\/html/i.test(ct)) return;
+
+        // Read a small sample for marker validation
+        const body = await r.text();
+        const sample = body.slice(0, 2000);
+
+        // Soft-404 detection: skip if response looks like a generic error page
+        if (/text\/html/i.test(ct) && /(?:404|not found|page not found|error|does not exist)/i.test(sample) && !marker) return;
+
+        // If a marker is specified, verify it exists in the response
+        if (marker && !sample.includes(marker)) return;
+
         found.push({
           path: path,
           status: r.status,
-          size: size ? parseInt(size) : null,
-          contentType: r.headers.get('content-type')
+          size: size ? parseInt(size) : body.length,
+          contentType: ct
         });
-        log(`Found exposed file: ${path} (${r.status})`);
-      }
-    } catch {}
-  });
-
-  await Promise.all(checks);
+        log(`Confirmed exposed file: ${path} (${r.status}, ct: ${ct})`);
+      } catch {}
+    });
+    await Promise.all(checks);
+    // Small delay between batches to avoid aggressive scanning detection
+    if (i + 5 < sensitiveFiles.length) await new Promise(r => setTimeout(r, 200));
+  }
   return found.length > 0 ? found : null;
 }
 
@@ -541,13 +592,13 @@ function extractIntelFromText(html) {
   const emails = html.match(emailRx);
   if (emails) emails.forEach(e => intel.emails.add(e.toLowerCase()));
 
-  // Phone number extraction (various formats)
-  const phoneRx = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})/g;
+  // Phone number extraction (international formats: US, UK, EU, intl prefix)
+  const phoneRx = /(?:\+\d{1,3}[-.\s]?)?\(?([0-9]{2,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})/g;
   const phones = html.match(phoneRx);
-  if (phones) phones.forEach(p => intel.phones.add(p));
+  if (phones) phones.filter(p => p.replace(/\D/g, '').length >= 7).forEach(p => intel.phones.add(p));
 
-  // Social media links
-  const socialRx = /(https?:\/\/)?(www\.)?(twitter|linkedin|facebook|github|instagram|youtube)\.com\/[A-Za-z0-9_\-\.\/]+/gi;
+  // Social media links (updated: includes x.com, tiktok, mastodon, threads)
+  const socialRx = /(https?:\/\/)?(www\.)?(twitter|x|linkedin|facebook|github|instagram|youtube|tiktok|mastodon\.social|threads\.net)\.com\/[A-Za-z0-9_\-\.\/]+/gi;
   const social = html.match(socialRx);
   if (social) social.forEach(s => intel.socialLinks.add(s));
 
@@ -642,7 +693,7 @@ function analyzeForms(html) {
       inputs: inputs.length,
       hasPassword,
       hasHidden,
-      sensitive: hasPassword || method.toUpperCase() === 'GET' && hasPassword
+      sensitive: hasPassword || (method.toUpperCase() === 'GET' && hasHidden)
     });
   }
 
@@ -725,29 +776,44 @@ function analyzeCookies(headers) {
   return analysis;
 }
 
-// JavaScript Library Detection with CVE mapping
-function detectJSLibraries(html, scripts) {
+// JavaScript Library Detection - scans script URLs and HTML for library references
+// Note: `scripts` is an array of script URLs (not content), so patterns match URL paths
+function detectJSLibraries(html, scriptUrls) {
   const libraries = [];
-  const allContent = html + ' ' + (scripts || []).join(' ');
+  const seen = new Set();
+  // Combine script URLs and HTML meta/link references for matching
+  const urlsStr = (scriptUrls || []).join(' ');
 
+  // Patterns tuned for URL path matching (e.g., "/jquery-3.6.0.min.js")
   const libPatterns = [
-    { name: 'jQuery', rx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+)|min)/i },
-    { name: 'Angular', rx: /angular(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'React', rx: /react(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Vue', rx: /vue(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Bootstrap', rx: /bootstrap(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Lodash', rx: /lodash(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Moment.js', rx: /moment(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'D3', rx: /d3(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i }
+    { name: 'jQuery', urlRx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+))/i },
+    { name: 'Angular', urlRx: /angular(?:js)?[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /ng-app|ng-controller/i },
+    { name: 'React', urlRx: /react(?:-dom)?[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /data-reactroot|data-reactid|__NEXT_DATA__/i },
+    { name: 'Vue', urlRx: /vue[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /data-v-[a-f0-9]|__vue__/i },
+    { name: 'Bootstrap', urlRx: /bootstrap[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Lodash', urlRx: /lodash[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Moment.js', urlRx: /moment[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'D3', urlRx: /d3[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Axios', urlRx: /axios[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Three.js', urlRx: /three[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null }
   ];
 
   for (const lib of libPatterns) {
-    const match = allContent.match(lib.rx);
-    if (match) {
-      libraries.push({
-        name: lib.name,
-        version: match[1] || 'unknown'
-      });
+    if (seen.has(lib.name)) continue;
+    // Check URLs first (more reliable for version extraction)
+    const urlMatch = urlsStr.match(lib.urlRx);
+    if (urlMatch) {
+      seen.add(lib.name);
+      libraries.push({ name: lib.name, version: urlMatch[1] || 'detected' });
+      continue;
+    }
+    // Fallback: check HTML for DOM markers (no version available)
+    if (lib.htmlRx) {
+      const htmlMatch = html.match(lib.htmlRx);
+      if (htmlMatch) {
+        seen.add(lib.name);
+        libraries.push({ name: lib.name, version: 'detected' });
+      }
     }
   }
 
@@ -778,8 +844,8 @@ const SECRET_PATTERNS=[
   // Discord
   {id:"discord_token", rx:/[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g},
   {id:"discord_webhook", rx:/https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d{17,19}\/[A-Za-z0-9_\-]{68}/g},
-  // Telegram
-  {id:"telegram_bot", rx:/\b\d{8,10}:[A-Za-z0-9_\-]{35}\b/g},
+  // Telegram (require "bot" context to reduce false positives)
+  {id:"telegram_bot", rx:/(?:bot|telegram|tg)[\s:=]*\d{8,10}:[A-Za-z0-9_\-]{35}/gi},
   // Payment Processors
   {id:"stripe_key", rx:/(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,99}/g},
   {id:"paypal_braintree", rx:/access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}/g},
@@ -808,21 +874,18 @@ const SECRET_PATTERNS=[
   // Private Keys
   {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP|PRIVATE) (?:PRIVATE )?KEY-----/g},
   {id:"ssh_key", rx:/ssh-rsa\s+AAAA[0-9A-Za-z+\/]+[=]{0,3}/g},
-  // Crypto & Blockchain
-  {id:"ethereum_key", rx:/0x[a-fA-F0-9]{64}/g},
-  {id:"bitcoin_address", rx:/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g},
-  // Network & Infrastructure
-  {id:"internal_ip", rx:/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g},
-  {id:"ipv6_address", rx:/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g},
-  // API Endpoints & Routes
-  {id:"endpoint_url", rx:/https?:\/\/[a-z0-9\.\-]+(?::\d{2,5})?(?:\/[A-Za-z0-9_\-\.~%\/\?\=\&#]+)?/gi},
+  // Crypto & Blockchain (tightened to reduce false positives)
+  {id:"ethereum_private_key", rx:/(?:private[-_]?key|PRIVATE[-_]?KEY|eth[-_]?key)[\s:=]+["']?0x[a-fA-F0-9]{64}["']?/gi},
+  // Network & Infrastructure (only flag internal IPs when embedded in config-like contexts)
+  {id:"internal_ip", rx:/(?:["'=:]\s*)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?=["'\s;,\]}])/g},
+  // API Endpoints & Routes (only match routes with sensitive path segments, NOT all URLs)
   {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v\d+|graphql|admin|internal|wp-json)\/[A-Za-z0-9_\-\/\.]+/gi},
   {id:"api_key_assign", rx:/(?:api[_-]?key|apikey|token|secret|password|passwd|bearer|auth)[\s]*[:=][\s]*["'][^"']{8,}["']/gi},
   // Additional Secrets
   {id:"npm_token", rx:/npm_[A-Za-z0-9]{36}/g},
   {id:"pypi_token", rx:/pypi-[A-Za-z0-9\-_]{32,}/g},
   {id:"docker_hub_token", rx:/dckr_pat_[A-Za-z0-9_-]{32,}/g},
-  {id:"datadog_key", rx:/[a-f0-9]{32}(?:-[a-f0-9]{8})?/g}
+  {id:"datadog_api_key", rx:/(?:DATADOG|DD)[-_]?(?:API[-_]?KEY|APP[-_]?KEY)[\s:=]+["']?[a-f0-9]{32}["']?/gi}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
 async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await r.text(); return t.slice(0, 300*1024);}catch{ return ""; } }
@@ -1126,7 +1189,24 @@ async function enrichCVEsForCPE(cpe) {
 // state
 const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${tabId}`]: data });
 const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
-async function patchState(tabId, patch){ const cur=await getTabData(tabId)||{}; const next=merge(cur,patch); await setTabData(tabId,next); return next; }
+const patchLocks = new Map();
+async function patchState(tabId, patch){
+  // Serialize concurrent patches per tab to prevent race conditions
+  const key = `tab:${tabId}`;
+  while (patchLocks.get(key)) { await patchLocks.get(key); }
+  let resolve;
+  const lock = new Promise(r => { resolve = r; });
+  patchLocks.set(key, lock);
+  try {
+    const cur = await getTabData(tabId) || {};
+    const next = merge(cur, patch);
+    await setTabData(tabId, next);
+    return next;
+  } finally {
+    patchLocks.delete(key);
+    resolve();
+  }
+}
 
 // Technology detection - Comprehensive fingerprinting from headers, meta tags, and DOM hints
 function detectTech({headers={}, meta={}, domHints={}, faviconHash}){
@@ -1631,3 +1711,17 @@ async function analyze(tabId, url){
   }catch(e){ await setTabData(tabId, { url, error: String(e) }); }
 }
 chrome.tabs.onUpdated.addListener((tabId, info, tab)=>{ if(info.status==="complete" && tab?.url) analyze(tabId, tab.url); });
+
+// Clean up per-tab data when tabs are closed to prevent memory leaks
+chrome.tabs.onRemoved.addListener((tabId) => {
+  headersByTab.delete(tabId);
+  resourcesByTab.delete(tabId);
+  scannedByTab.delete(tabId);
+  patchLocks.delete(`tab:${tabId}`);
+  if (highlightTimers.has(tabId)) {
+    clearTimeout(highlightTimers.get(tabId));
+    highlightTimers.delete(tabId);
+  }
+  chrome.storage.session.remove(`tab:${tabId}`).catch(() => {});
+  log(`Cleaned up data for closed tab ${tabId}`);
+});

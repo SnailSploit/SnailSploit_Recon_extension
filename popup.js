@@ -232,7 +232,7 @@ function aiCorrelationCard(s){
     card.appendChild(el('<div class="small">AI analysis running in background... (requires OpenAI API key in Options)</div>'));
     return card;
   }
-  // Parse markdown and display
+  // Parse markdown and display using insertAdjacentHTML to avoid re-parsing existing children
   const content = s.aiCorrelation.split('\n').map(line => {
     if(line.startsWith('###')) return `<h4 style="margin:8px 0 4px 0;font-size:11px">${esc(line.replace(/^###\s*/,''))}</h4>`;
     if(line.startsWith('##')) return `<h4 style="margin:10px 0 6px 0;font-size:12px;font-weight:bold">${esc(line.replace(/^##\s*/,''))}</h4>`;
@@ -240,7 +240,7 @@ function aiCorrelationCard(s){
     if(line.trim()) return `<div class="small">${esc(line)}</div>`;
     return '';
   }).join('');
-  card.innerHTML += content;
+  card.insertAdjacentHTML('beforeend', content);
   return card;
 }
 
@@ -481,21 +481,17 @@ function exportHTTPX(s){
 }
 
 function showBookmarklet(){
-  const code = `javascript:(function(){
-    const d=document.domain;
-    chrome.runtime.sendMessage('${chrome.runtime.id}', {type:'quickRecon',domain:d}, r=>{
-      alert('SnailSploit Recon started for: '+d);
-    });
-  })();`;
+  // Bookmarklet that performs lightweight inline recon (no extension APIs needed)
+  const code = `javascript:void(function(){var d=document.domain,h=location.href,o='';o+='Domain: '+d+'\\n';o+='URL: '+h+'\\n';var c=document.querySelectorAll('script[src]');o+='External scripts: '+c.length+'\\n';c.forEach(function(s){o+='  '+s.src+'\\n'});var m=document.querySelector('meta[name=generator]');if(m)o+='Generator: '+m.content+'\\n';var f=document.querySelectorAll('form');o+='Forms: '+f.length+'\\n';f.forEach(function(x,i){o+='  '+(x.method||'GET').toUpperCase()+' -> '+(x.action||'(self)')+'\\n'});var e=document.documentElement.outerHTML.match(/[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Z|a-z]{2,}/g);if(e&&e.length)o+='Emails: '+[...new Set(e)].join(', ')+'\\n';var cm=document.documentElement.outerHTML.match(/<!--[\\s\\S]*?-->/g);if(cm)o+='HTML comments: '+cm.length+'\\n';var w=document.createElement('div');w.style.cssText='position:fixed;top:10px;right:10px;z-index:999999;background:#111;color:#0f0;padding:16px;border-radius:8px;font:12px monospace;max-width:500px;max-height:80vh;overflow:auto;white-space:pre-wrap';w.textContent=o;var b=document.createElement('button');b.textContent='Close';b.style.cssText='margin-top:8px;padding:4px 12px;cursor:pointer';b.onclick=function(){w.remove()};w.appendChild(b);document.body.appendChild(w)}())`;
 
   const modal = el(`<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center" id="bookmarkletModal">
     <div style="background:white;padding:24px;border-radius:8px;max-width:600px;width:90%">
       <h3 style="margin-top:0">Quick Recon Bookmarklet</h3>
-      <p class="small">Drag this link to your bookmarks bar, or copy the code:</p>
+      <p class="small">Drag this link to your bookmarks bar, or copy the code. This runs a lightweight page-only recon (no extension required):</p>
       <div style="background:#f5f5f5;padding:12px;border-radius:4px;margin:12px 0;word-break:break-all;font-family:monospace;font-size:11px">
-        <a href="${esc(code)}" style="color:#1976d2;text-decoration:none">⚡ SnailSploit Quick Recon</a>
+        <a href="${esc(code)}" style="color:#1976d2;text-decoration:none">SnailSploit Quick Recon</a>
       </div>
-      <p class="small"><b>Usage:</b> Click the bookmark on any website to instantly trigger reconnaissance.</p>
+      <p class="small"><b>Detects:</b> scripts, forms, emails, HTML comments, generator meta. For full recon, use the extension popup.</p>
       <button class="btn" id="closeModal" style="margin-top:12px">Close</button>
       <button class="btn" id="copyCode" style="margin-top:12px;margin-left:8px">Copy Code</button>
     </div>
