@@ -40,6 +40,7 @@ function headersCard(h){
 function ipsCard(s){
   const card=el(`<div class="card"><h3>IPs</h3></div>`);
   const ips=s.ips||[]; if(!ips.length){ card.appendChild(el('<div class="small">loading…</div>')); return card; }
+  card.querySelector("h3").appendChild(copyBtn(ips.join("\n"), "Copy IPs"));
   for(const ip of ips){
     const per=s.perIp?.[ip]||{}; const sh=per.internetdb||{}; const geo=per.ipwhois||{};
     const row = el(`<div class="row">
@@ -87,6 +88,7 @@ function secretsCard(s){
 function subsCard(s){
   const card=el(`<div class="card"><h3>Live Subdomains</h3><div id="subs"></div></div>`); const box=card.querySelector("#subs");
   const subs=s.quickSubs||[]; if(!subs.length){ box.appendChild(el('<div class="small">resolving…</div>')); return card; }
+  card.querySelector("h3").appendChild(copyBtn(subs.map(x=>x.subdomain).join("\n"), "Copy All"));
   for(const it of subs){
     const vt = s.vt?.[it.subdomain];
     const vtHTML = vt ? `<div class="small">VT rep: <b>${esc(vt.reputation??0)}</b> · <code>${esc(JSON.stringify(vt.last_analysis_stats||{}))}</code></div>` : `<button class="btn vt" data-sub="${esc(it.subdomain)}">Enrich with VirusTotal</button>`;
@@ -186,7 +188,9 @@ function intelCard(s){
   if(!intel){ card.appendChild(el('<div class="small">analyzing page…</div>')); return card; }
 
   if(intel.emails && intel.emails.length > 0){
-    card.appendChild(el(`<details class="row"><summary><b>Email Addresses (${intel.emails.length})</b></summary><div>${intel.emails.map(e=>`<code>${esc(e)}</code>`).join(" ")}</div></details>`));
+    const emailRow = el(`<details class="row"><summary><b>Email Addresses (${intel.emails.length})</b></summary><div>${intel.emails.map(e=>`<code>${esc(e)}</code>`).join(" ")}</div></details>`);
+    emailRow.querySelector("div").appendChild(copyBtn(intel.emails.join("\n"), "Copy"));
+    card.appendChild(emailRow);
   }
 
   if(intel.phones && intel.phones.length > 0){
@@ -275,14 +279,101 @@ function aiEnhancedSubsCard(s){
   return card;
 }
 
+// Copy-to-clipboard helper
+function copyBtn(text, label="Copy") {
+  const b = document.createElement("button");
+  b.className = "btn"; b.textContent = label; b.style.cssText = "font-size:10px;padding:2px 6px;margin-left:4px";
+  b.addEventListener("click", () => { navigator.clipboard.writeText(text); b.textContent = "Copied!"; setTimeout(() => b.textContent = label, 1200); });
+  return b;
+}
+
+// Collapsible card wrapper
+function collapsible(title, contentFn, startOpen=true) {
+  const card = el(`<div class="card"><h3 style="cursor:pointer;user-select:none" class="collapsible-toggle">${title} <span style="float:right;font-size:10px">${startOpen?'▼':'▶'}</span></h3></div>`);
+  const body = document.createElement("div");
+  body.style.display = startOpen ? "block" : "none";
+  contentFn(body);
+  card.appendChild(body);
+  card.querySelector(".collapsible-toggle").addEventListener("click", () => {
+    const open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    card.querySelector(".collapsible-toggle span").textContent = open ? "▶" : "▼";
+  });
+  return card;
+}
+
+// Scan progress tracker
+function progressCard(s) {
+  const phases = [
+    { key: "headers", label: "Headers", done: !!s.headers && Object.values(s.headers).some(Boolean) },
+    { key: "ips", label: "IPs", done: Array.isArray(s.ips) },
+    { key: "tlsInfo", label: "TLS", done: s.tlsInfo !== undefined },
+    { key: "corsFindings", label: "CORS", done: s.corsFindings !== undefined },
+    { key: "sensitiveFiles", label: "Files", done: s.sensitiveFiles !== undefined },
+    { key: "dmarc", label: "DMARC", done: !!s.dmarc },
+    { key: "quickSubs", label: "Subdomains", done: Array.isArray(s.quickSubs) && s.quickSubs.length > 0 },
+    { key: "secrets", label: "Secrets", done: Array.isArray(s.secrets) },
+    { key: "waybackUrls", label: "Wayback", done: s.waybackUrls !== undefined },
+    { key: "tech", label: "Tech", done: !!s.tech }
+  ];
+  const done = phases.filter(p => p.done).length;
+  const pct = Math.round((done / phases.length) * 100);
+  const allDone = pct === 100;
+  if (allDone) return null; // Hide when complete
+  const card = el(`<div class="card" style="padding:8px 10px"><div style="display:flex;align-items:center;gap:8px"><b class="small">Scanning… ${pct}%</b><div style="flex:1;height:4px;background:#eee;border-radius:2px;overflow:hidden"><div style="width:${pct}%;height:100%;background:#1976d2;border-radius:2px;transition:width .3s"></div></div></div><div style="margin-top:4px">${phases.map(p => `<span class="chip" style="${p.done?'background:#e8f5e9;border-color:#4caf50;color:#2e7d32':'opacity:0.4'}">${p.label}</span>`).join(" ")}</div></div>`);
+  return card;
+}
+
+// Subdomain takeover card
+function takeoverCard(s) {
+  if (!s.subdomainTakeovers || !s.subdomainTakeovers.length) return null;
+  return collapsible("⚠ Subdomain Takeover", body => {
+    for (const t of s.subdomainTakeovers) {
+      const row = el(`<div class="row" style="background:#ffebee;border:1px solid #ef5350;border-radius:6px;padding:8px;margin:4px 0">
+        <div><b style="color:#b71c1c">${esc(t.subdomain)}</b> → <code>${esc(t.cname)}</code></div>
+        <div class="small">Service: <b>${esc(t.service)}</b> · Confidence: ${esc(t.confidence)}</div>
+      </div>`);
+      body.appendChild(row);
+    }
+  });
+}
+
+// Wayback Machine card
+function waybackCard(s) {
+  if (!s.waybackUrls || !s.waybackUrls.length) return null;
+  return collapsible("🕐 Wayback Machine URLs", body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">${s.waybackUrls.length} interesting historical URLs found${s.waybackAll ? ` (${s.waybackAll.length} total)` : ''}</div>`));
+    const copyAll = copyBtn(s.waybackUrls.join("\n"), "Copy All");
+    body.appendChild(copyAll);
+    for (const u of s.waybackUrls.slice(0, 30)) {
+      body.appendChild(el(`<div class="mono small" style="margin:2px 0;word-break:break-all">${esc(u)}</div>`));
+    }
+    if (s.waybackUrls.length > 30) body.appendChild(el(`<div class="small">…and ${s.waybackUrls.length - 30} more (export to see all)</div>`));
+  }, false);
+}
+
 async function render(){
-  const root=document.getElementById("root"); const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
+  const root=document.getElementById("root");
+  // Preserve scroll position across re-renders
+  const scrollY = root.parentElement?.scrollTop || 0;
+  const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
   if(!s){ root.textContent="No data yet. Reload the page."; return; } if(s.error){ root.textContent=`Error: ${s.error}`; return; }
+
   root.appendChild(headerCard(s));
+
+  // Progress bar (auto-hides when complete)
+  const prog = progressCard(s);
+  if (prog) root.appendChild(prog);
+
   root.appendChild(highlightsCard(s));
+
+  // Critical findings first: subdomain takeover
+  const tkCard = takeoverCard(s);
+  if (tkCard) root.appendChild(tkCard);
+
   root.appendChild(headersCard(s.headers));
 
-  // New security analysis cards
+  // Security analysis cards
   if(s.tlsInfo || s.corsFindings || s.httpMethods || s.sensitiveFiles || s.cookieSecurity) {
     if(s.tlsInfo) root.appendChild(tlsCard(s));
     root.appendChild(securityChecksCard(s));
@@ -306,10 +397,18 @@ async function render(){
   root.appendChild(mailCard(s));
   root.appendChild(textsCard(s));
   root.appendChild(secretsCard(s));
+
+  // Wayback Machine URLs
+  const wbCard = waybackCard(s);
+  if (wbCard) root.appendChild(wbCard);
+
   root.appendChild(subsCard(s));
   if(s.aiEnhancedSubs && s.aiEnhancedSubs.length > 0) root.appendChild(aiEnhancedSubsCard(s));
   root.appendChild(externalToolsCard(s));
   root.appendChild(exportCard(s));
+
+  // Restore scroll position
+  if (scrollY) requestAnimationFrame(() => { root.parentElement.scrollTop = scrollY; });
 }
 
 function externalToolsCard(s){
@@ -559,6 +658,8 @@ function exportCard(s){
     report += `\nIP Addresses: ${(s.ips||[]).join(', ')}\n`;
     if(s.quickSubs?.length) report += `\nSubdomains (${s.quickSubs.length}):\n${s.quickSubs.map(x=>x.subdomain).join('\n')}\n`;
     if(s.secrets?.length) report += `\nSecrets Found: ${s.secrets.length} sources\n`;
+    if(s.waybackUrls?.length) report += `\nWayback Machine URLs (${s.waybackUrls.length} interesting):\n${s.waybackUrls.join('\n')}\n`;
+    if(s.subdomainTakeovers?.length) report += `\nSubdomain Takeovers:\n${s.subdomainTakeovers.map(t=>`${t.subdomain} → ${t.service} (${t.cname})`).join('\n')}\n`;
     const blob = new Blob([report], {type: 'text/plain'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -570,8 +671,15 @@ function exportCard(s){
   return card;
 }
 
+// Debounce render to prevent flickering from rapid state updates
+let renderTimer = null;
+function debouncedRender() {
+  if (renderTimer) clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => { renderTimer = null; render(); }, 250);
+}
+
 (async()=>{
   TAB_ID=await getTabId();
   await render();
-  chrome.storage.onChanged.addListener((changes, area) => { if(area!=="session") return; const key=`tab:${TAB_ID}`; if(changes[key]) render(); });
+  chrome.storage.onChanged.addListener((changes, area) => { if(area!=="session") return; const key=`tab:${TAB_ID}`; if(changes[key]) debouncedRender(); });
 })();

@@ -343,6 +343,27 @@ async function subdomainsPassive(domain){
         logError(`Anubis lookup failed for ${q}:`, e);
       }
       return [];
+    })(),
+
+    // AlienVault OTX - passive DNS aggregator (4th source)
+    (async () => {
+      try {
+        log(`Fetching subdomains from AlienVault OTX for ${q}...`);
+        const r = await fetchWithTimeout(`https://otx.alienvault.com/api/v1/indicators/domain/${encodeURIComponent(q)}/passive_dns`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+        if (r.ok) {
+          const j = await r.json();
+          const results = [];
+          for (const entry of (j.passive_dns || [])) {
+            const h = (entry.hostname || "").trim();
+            if (h && h.endsWith(q) && h !== q) results.push(h);
+          }
+          log(`AlienVault OTX found ${results.length} subdomains`);
+          return results;
+        }
+      } catch (e) {
+        logError(`AlienVault OTX lookup failed for ${q}:`, e);
+      }
+      return [];
     })()
   ]);
 
@@ -361,7 +382,7 @@ async function subdomainsPassive(domain){
 
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
-  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch(e){ log(`DNS resolve failed for ${s}:`, e.message); } } }
+  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); const cnames=(await dohResolve(s,"A")).filter(x=>x.type===5).map(x=>x.data?.replace(/\.$/,"")); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6,cnames}); }catch(e){ log(`DNS resolve failed for ${s}:`, e.message); } } }
   await Promise.all(Array.from({length:limit},worker)); return out.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_LIVE);
 }
 
@@ -448,6 +469,37 @@ async function getTLSInfo(hostname) {
   } catch (e) {
     logError(`TLS info extraction failed for ${hostname}:`, e);
     return null;
+  }
+}
+
+// Wayback Machine URL Discovery - Finds historical URLs for the target domain
+// Reveals old endpoints, forgotten admin panels, API routes, and URL parameters
+async function waybackUrls(domain) {
+  try {
+    log(`Fetching Wayback Machine URLs for ${domain}...`);
+    const r = await fetchWithTimeout(
+      `https://web.archive.org/cdx/search/cdx?url=*.${encodeURIComponent(domain)}/*&output=json&fl=original&collapse=urlkey&limit=200`,
+      {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE
+    );
+    if (!r.ok) return [];
+    const rows = await r.json();
+    // First row is header ["original"], skip it
+    const urls = new Set();
+    for (let i = 1; i < rows.length; i++) {
+      const u = rows[i]?.[0];
+      if (u && typeof u === "string") urls.add(u);
+    }
+    // Deduplicate by path (strip query string for grouping, but keep full URL)
+    const unique = [...urls].slice(0, 150);
+    log(`Wayback Machine found ${unique.length} unique URLs for ${domain}`);
+    // Extract interesting patterns: admin, api, config, backup, login, upload
+    const interesting = unique.filter(u =>
+      /\b(admin|api|login|upload|config|backup|dashboard|debug|internal|console|panel|phpinfo|wp-admin|.env|graphql|swagger)\b/i.test(u)
+    );
+    return { all: unique, interesting: interesting.slice(0, 50) };
+  } catch (e) {
+    logError(`Wayback Machine lookup failed for ${domain}:`, e);
+    return { all: [], interesting: [] };
   }
 }
 
@@ -906,9 +958,23 @@ async function runSecretsScan(tabId, state, resources, origin){
   const results = state.secrets ? [...state.secrets] : [];
   const inline = Array.isArray(resources?.inlineScripts)? resources.inlineScripts : [];
   const external = Array.isArray(resources?.externalScripts)? resources.externalScripts.slice(0,12) : [];
+  // Inline scripts (fast, no I/O)
   for(const chunk of inline){ const f=scanText(chunk); if(f.length) results.push({source:"inline_script", findings:f}); if(results.length>=20) break; }
-  for(const url of external){ if(scanned.has(url)) continue; scanned.add(url); const text=await fetchText(url); if(!text) continue; const f=scanText(text); if(f.length) results.push({source:url, findings:f}); if(results.length>=20) break; }
-  if(!scanned.has("__HTML__") && origin){ scanned.add("__HTML__"); try{ const r=await fetchWithTimeout(origin,{},2500); if(r.ok){ const ct=r.headers.get("content-type")||""; if(/text\/html/i.test(ct)){ const html=(await r.text()).slice(0,200*1024); const f=scanText(html); if(f.length) results.push({source:"document_html", findings:f}); } } }catch{} }
+  // External scripts - fetch in parallel batches of 4 for speed
+  const toFetch = external.filter(url => !scanned.has(url));
+  toFetch.forEach(url => scanned.add(url));
+  for (let i = 0; i < toFetch.length && results.length < 20; i += 4) {
+    const batch = toFetch.slice(i, i + 4);
+    const texts = await Promise.all(batch.map(url => fetchText(url)));
+    for (let j = 0; j < batch.length; j++) {
+      if (!texts[j]) continue;
+      const f = scanText(texts[j]);
+      if (f.length) results.push({ source: batch[j], findings: f });
+      if (results.length >= 20) break;
+    }
+  }
+  // HTML document scan
+  if(!scanned.has("__HTML__") && origin){ scanned.add("__HTML__"); try{ const r=await fetchWithTimeout(origin,{},2500); if(r.ok){ const ct=r.headers.get("content-type")||""; if(/text\/html/i.test(ct)){ const html=(await r.text()).slice(0,200*1024); const f=scanText(html); if(f.length) results.push({source:"document_html", findings:f}); } } }catch(e){ log(`HTML secrets scan failed:`, e.message); } }
   let favHash = state.faviconHash || null; const fav = resources?.favicon || (origin? new URL("/favicon.ico",origin).href:null); if(!favHash && fav) favHash = await faviconHash(fav);
   const patch = { secrets: results, faviconHash: favHash };
   const next = merge(state, patch); await setTabData(tabId, next); return next;
@@ -1390,6 +1456,16 @@ function deriveHighlights(state){
   // Secrets
   if(secrets.length) items.push({ severity:"high", title:"Potential secrets/endpoints", detail:`${secrets.length} sources flagged` });
 
+  // Subdomain Takeover
+  if(state.subdomainTakeovers && state.subdomainTakeovers.length > 0) {
+    items.push({ severity:"critical", title:"Subdomain takeover possible", detail: state.subdomainTakeovers.map(t => `${t.subdomain} → ${t.service}`).join(", ") });
+  }
+
+  // Wayback URLs
+  if(state.waybackUrls && state.waybackUrls.length > 0) {
+    items.push({ severity:"low", title:`${state.waybackUrls.length} historical URLs from Wayback Machine`, detail: "May reveal old endpoints, parameters, or forgotten pages" });
+  }
+
   // Intel Extraction
   if(state.intel) {
     if(state.intel.emails && state.intel.emails.length > 0) {
@@ -1662,11 +1738,38 @@ async function analyze(tabId, url){
       scheduleHighlights(tabId);
     })();
 
-    // Subdomains
+    // Wayback Machine URL discovery (background)
+    (async () => {
+      try {
+        const wb = await waybackUrls(domain);
+        if (wb.all.length) {
+          await patchState(tabId, { waybackUrls: wb.interesting, waybackAll: wb.all });
+          scheduleHighlights(tabId);
+        }
+      } catch (e) { logError(`Wayback Machine recon failed:`, e); }
+    })();
+
+    // Subdomains + takeover detection
     (async () => {
       const liveSubs = await subdomainsLive(domain);
       await patchState(tabId, { quickSubs: liveSubs });
       scheduleHighlights(tabId);
+
+      // Check for subdomain takeover on subs with CNAMEs (background)
+      const subsWithCnames = liveSubs.filter(s => s.cnames && s.cnames.length > 0);
+      if (subsWithCnames.length) {
+        const takeovers = [];
+        for (const sub of subsWithCnames.slice(0, 20)) {
+          try {
+            const result = await checkSubdomainTakeover(sub.subdomain, sub.cnames);
+            if (result) takeovers.push(result);
+          } catch (e) { log(`Takeover check failed for ${sub.subdomain}:`, e.message); }
+        }
+        if (takeovers.length) {
+          await patchState(tabId, { subdomainTakeovers: takeovers });
+          scheduleHighlights(tabId);
+        }
+      }
     })();
 
     // AI-Enhanced Subdomain Recon (background task)
