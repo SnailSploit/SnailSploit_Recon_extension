@@ -720,6 +720,230 @@ async function checkSubdomainTakeover(subdomain, cnames) {
   return null;
 }
 
+// ============ LEAD GENERATION ENGINE ============
+// Extracts actionable intelligence that tells pentesters WHERE to look
+
+// Extract API endpoints, routes, and interesting URLs from JavaScript source
+function extractJSEndpoints(jsText) {
+  const endpoints = new Set();
+  const apiPatterns = [
+    // Fetch/XHR calls: fetch("/api/users"), axios.get("/v1/data")
+    /(?:fetch|axios\.(?:get|post|put|delete|patch)|\.ajax|\.open)\s*\(\s*["'`](\/[^"'`\s]{3,})/gi,
+    // Route definitions: router.get("/users/:id"), app.post("/api")
+    /(?:router|app|server)\.(?:get|post|put|delete|patch|all|use)\s*\(\s*["'`](\/[^"'`\s]{3,})/gi,
+    // String assignments that look like API paths
+    /(?:url|endpoint|path|route|api|href|action|src)\s*[:=]\s*["'`](\/(?:api|v\d|graphql|auth|admin|user|account|dashboard|internal|ws|socket)[^"'`\s]*)/gi,
+    // Full URL patterns pointing to APIs
+    /["'`](https?:\/\/[^"'`\s]*\/(?:api|v\d|graphql|auth|admin|internal|ws)[^"'`\s]*)/gi,
+    // GraphQL operations
+    /(?:query|mutation|subscription)\s+(\w+)\s*[\({]/g,
+    // Webpack/build config API base URLs
+    /(?:BASE_URL|API_URL|BACKEND|SERVER_URL|API_HOST|API_BASE)\s*[:=]\s*["'`]([^"'`\s]+)/gi,
+  ];
+  for (const rx of apiPatterns) {
+    rx.lastIndex = 0;
+    let m;
+    while ((m = rx.exec(jsText)) !== null) {
+      const ep = m[1];
+      if (ep && ep.length > 2 && ep.length < 200) endpoints.add(ep);
+    }
+  }
+  return [...endpoints];
+}
+
+// Extract URL parameters for injection testing
+function extractParameters(urls) {
+  const params = new Map(); // param name → Set of example values
+  for (const url of urls) {
+    try {
+      const u = new URL(url, "https://placeholder.test");
+      for (const [k, v] of u.searchParams) {
+        if (!params.has(k)) params.set(k, new Set());
+        if (v && v.length < 100) params.get(k).add(v);
+      }
+    } catch {}
+  }
+  // Convert to array sorted by frequency (most-seen params first)
+  return [...params.entries()]
+    .map(([name, values]) => ({ name, examples: [...values].slice(0, 3), count: values.size }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 40);
+}
+
+// Detect login/auth surfaces from forms, URLs, and page content
+function detectAuthSurfaces(forms, urls, html) {
+  const surfaces = [];
+
+  // Check forms for auth patterns
+  if (forms) {
+    for (const form of forms) {
+      if (form.hasPassword) {
+        surfaces.push({
+          type: "login_form",
+          detail: `${form.method} ${form.action || "(self)"}`,
+          risk: "high",
+          why: "Password field found - test default creds, brute force, SQLi in login"
+        });
+      }
+    }
+  }
+
+  // Check URLs for auth-related paths
+  const authPaths = /\b(login|signin|sign-in|auth|oauth|sso|saml|jwt|register|signup|sign-up|forgot|reset-password|2fa|mfa|token|session|api[-_]?key)\b/i;
+  const seen = new Set();
+  for (const url of (urls || [])) {
+    if (authPaths.test(url)) {
+      const path = url.replace(/https?:\/\/[^\/]+/, "").split("?")[0];
+      if (!seen.has(path)) {
+        seen.add(path);
+        surfaces.push({
+          type: "auth_endpoint",
+          detail: url.length > 120 ? url.slice(0, 120) + "…" : url,
+          risk: "medium",
+          why: "Auth-related endpoint - test for bypasses, token leaks, rate limits"
+        });
+      }
+    }
+  }
+
+  // Check HTML for OAuth/SSO integrations
+  if (html) {
+    if (/accounts\.google\.com|googleapis\.com\/auth/i.test(html)) surfaces.push({ type: "oauth", detail: "Google OAuth", risk: "medium", why: "Test OAuth misconfiguration, redirect_uri manipulation" });
+    if (/graph\.facebook\.com|facebook\.com\/v\d+/i.test(html)) surfaces.push({ type: "oauth", detail: "Facebook Login", risk: "medium", why: "Test OAuth state parameter, CSRF in OAuth flow" });
+    if (/github\.com\/login\/oauth/i.test(html)) surfaces.push({ type: "oauth", detail: "GitHub OAuth", risk: "medium", why: "Test scope escalation, token leakage" });
+    if (/cognito|auth0|okta|keycloak/i.test(html)) surfaces.push({ type: "sso", detail: html.match(/cognito|auth0|okta|keycloak/i)[0], risk: "medium", why: "Centralised auth provider - check for misconfig, token reuse" });
+  }
+
+  return surfaces.slice(0, 15);
+}
+
+// Extract hardcoded configs, debug flags, and interesting JS globals
+function extractJSConfigs(jsText) {
+  const configs = [];
+  const patterns = [
+    { rx: /(?:debug|DEBUG|verbose|VERBOSE)\s*[:=]\s*(true|1|"true")/g, type: "debug_flag", why: "Debug mode enabled - may expose stack traces, verbose errors" },
+    { rx: /(?:NODE_ENV|ENVIRONMENT|ENV)\s*[:=]\s*["'`](development|staging|test|dev)["'`]/gi, type: "non_prod_env", why: "Non-production environment flag - likely less hardened" },
+    { rx: /(?:admin|ADMIN)[-_]?(?:URL|PATH|ROUTE|PANEL)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "admin_path", why: "Admin panel path discovered" },
+    { rx: /(?:firebase|supabase|amplify)Config\s*[:=]\s*\{/gi, type: "backend_config", why: "Backend-as-a-Service config exposed - check for public write access" },
+    { rx: /(?:STRIPE|PAYPAL|SQUARE)[-_]?(?:KEY|TOKEN|SECRET)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "payment_config", why: "Payment processor config - check for live vs test keys" },
+    { rx: /(?:ws|wss):\/\/[^"'`\s]+/g, type: "websocket", why: "WebSocket endpoint - test for auth bypass, injection" },
+    { rx: /(?:bucket|BUCKET)[-_]?(?:NAME|URL|PATH)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "storage_bucket", why: "Cloud storage bucket reference - check for public access" },
+    { rx: /(?:SENTRY|DATADOG|NEWRELIC)[-_]?(?:DSN|KEY|TOKEN)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "monitoring", why: "Monitoring service config - may leak internal infra details" },
+  ];
+  for (const { rx, type, why } of patterns) {
+    rx.lastIndex = 0;
+    let m;
+    while ((m = rx.exec(jsText)) !== null) {
+      configs.push({ type, match: m[0].slice(0, 150), why });
+      if (configs.length >= 20) return configs;
+    }
+  }
+  return configs;
+}
+
+// MASTER LEAD GENERATOR - Correlates all findings into prioritised attack leads
+function generateLeads(state) {
+  const leads = [];
+
+  // Lead 1: Exposed sensitive files → direct exploitation
+  if (state.sensitiveFiles?.length) {
+    for (const f of state.sensitiveFiles) {
+      if (f.path.includes('.git')) {
+        leads.push({ priority: 1, category: "Source Code Leak", title: "Git repository exposed", detail: `${f.path} is accessible. Use git-dumper to extract full source code, then search for secrets, hardcoded creds, and business logic flaws.`, action: `git-dumper ${state.url}/.git/ ./dumped-repo` });
+      } else if (f.path.includes('.env')) {
+        leads.push({ priority: 1, category: "Credential Leak", title: "Environment file exposed", detail: `${f.path} accessible. Likely contains DB creds, API keys, and secrets. Fetch and extract immediately.`, action: `curl -s ${new URL(f.path, state.url).href}` });
+      } else if (f.path.includes('swagger') || f.path.includes('graphql')) {
+        leads.push({ priority: 2, category: "API Documentation", title: `API docs at ${f.path}`, detail: "API documentation is publicly accessible. Map all endpoints, test auth requirements, look for IDOR and mass assignment.", action: `Browse: ${new URL(f.path, state.url).href}` });
+      }
+    }
+  }
+
+  // Lead 2: CORS + credentials = account takeover
+  if (state.corsFindings?.length) {
+    const credsCors = state.corsFindings.find(f => f.credentials);
+    if (credsCors) {
+      leads.push({ priority: 1, category: "Account Takeover", title: "CORS allows credentials with reflected origin", detail: "Any origin can make credentialed requests. Build a PoC page that steals user data via cross-origin fetch with credentials:include.", action: "Create attacker page with: fetch(target, {credentials:'include'}).then(r=>r.json()).then(exfil)" });
+    }
+  }
+
+  // Lead 3: Subdomain takeovers = immediate win
+  if (state.subdomainTakeovers?.length) {
+    for (const t of state.subdomainTakeovers) {
+      leads.push({ priority: 1, category: "Subdomain Takeover", title: `Claim ${t.subdomain} on ${t.service}`, detail: `CNAME points to ${t.cname} but service is unclaimed. Register on ${t.service} to take control. Can be used for phishing, cookie theft, or CSP bypass.`, action: `Register ${t.cname} on ${t.service}` });
+    }
+  }
+
+  // Lead 4: Auth surfaces found
+  if (state.authSurfaces?.length) {
+    for (const auth of state.authSurfaces.slice(0, 3)) {
+      leads.push({ priority: auth.risk === "high" ? 2 : 3, category: "Auth Testing", title: auth.type.replace(/_/g, " "), detail: `${auth.detail} — ${auth.why}`, action: auth.detail });
+    }
+  }
+
+  // Lead 5: JS endpoints = hidden attack surface
+  if (state.jsEndpoints?.length) {
+    const adminEps = state.jsEndpoints.filter(e => /admin|internal|debug|config/i.test(e));
+    const apiEps = state.jsEndpoints.filter(e => /api|v\d|graphql/i.test(e));
+    if (adminEps.length) {
+      leads.push({ priority: 2, category: "Hidden Endpoints", title: `${adminEps.length} admin/internal endpoints in JS`, detail: `Found: ${adminEps.slice(0, 5).join(", ")}${adminEps.length > 5 ? "…" : ""}. Test for auth bypass, IDOR, privilege escalation.`, action: adminEps.slice(0, 3).join("\n") });
+    }
+    if (apiEps.length) {
+      leads.push({ priority: 3, category: "API Surface", title: `${apiEps.length} API endpoints discovered in JS`, detail: `Found: ${apiEps.slice(0, 5).join(", ")}${apiEps.length > 5 ? "…" : ""}. Fuzz parameters, test auth, check for IDOR.`, action: apiEps.slice(0, 5).join("\n") });
+    }
+  }
+
+  // Lead 6: Parameters for injection
+  if (state.discoveredParams?.length) {
+    const injectable = state.discoveredParams.filter(p =>
+      /id|user|name|query|search|q|url|redirect|file|path|page|callback|token|ref|sort|order|filter|lang|type/i.test(p.name)
+    );
+    if (injectable.length) {
+      leads.push({ priority: 2, category: "Injection Points", title: `${injectable.length} potentially injectable parameters`, detail: `High-interest params: ${injectable.slice(0, 8).map(p => p.name).join(", ")}. Test for SQLi, XSS, SSRF, path traversal, and IDOR.`, action: injectable.slice(0, 5).map(p => `${p.name}=${p.examples[0] || "FUZZ"}`).join("&") });
+    }
+  }
+
+  // Lead 7: JS configs (debug, non-prod, admin paths)
+  if (state.jsConfigs?.length) {
+    for (const cfg of state.jsConfigs.slice(0, 3)) {
+      leads.push({ priority: cfg.type === "debug_flag" || cfg.type === "non_prod_env" ? 2 : 3, category: "JS Config Leak", title: cfg.type.replace(/_/g, " "), detail: `${cfg.match} — ${cfg.why}`, action: cfg.match });
+    }
+  }
+
+  // Lead 8: High-severity CVEs with known exploits
+  const allCves = [];
+  for (const [ip, data] of Object.entries(state.perIp || {})) {
+    for (const cve of (data.cve_enrich || [])) {
+      if (Number(cve.score) >= 8) allCves.push({ ...cve, ip });
+    }
+  }
+  if (allCves.length) {
+    leads.push({ priority: 2, category: "Known Vulnerabilities", title: `${allCves.length} high-severity CVEs (CVSS ≥ 8)`, detail: allCves.slice(0, 5).map(c => `${c.id} (${c.score}) on ${c.ip}`).join(", "), action: `searchsploit ${allCves[0].id}` });
+  }
+
+  // Lead 9: Dangerous HTTP methods
+  if (state.httpMethods?.risky) {
+    leads.push({ priority: 3, category: "HTTP Methods", title: `Dangerous methods: ${state.httpMethods.dangerous.join(", ")}`, detail: "PUT/DELETE may allow file upload or resource modification. Test with curl.", action: `curl -X PUT ${state.url}/test.txt -d "pwned"` });
+  }
+
+  // Lead 10: Missing security headers → XSS potential
+  const headers = state.headers || {};
+  if (!headers["content-security-policy"] && !headers["x-frame-options"]) {
+    leads.push({ priority: 3, category: "XSS/Clickjacking", title: "No CSP or X-Frame-Options", detail: "Page can be framed and has no CSP. Test for reflected/stored XSS and clickjacking.", action: `<iframe src="${state.url}"></iframe>` });
+  }
+
+  // Lead 11: Insecure cookies
+  if (state.cookieSecurity?.some(c => c.issues.length > 0 && !c.httpOnly)) {
+    const vulnCookies = state.cookieSecurity.filter(c => !c.httpOnly);
+    if (vulnCookies.length) {
+      leads.push({ priority: 3, category: "Session Hijacking", title: `${vulnCookies.length} cookies accessible via JavaScript`, detail: `Cookies without HttpOnly: ${vulnCookies.map(c => c.name).join(", ")}. If XSS exists, these can be stolen.`, action: "document.cookie" });
+    }
+  }
+
+  // Sort by priority (1=critical, 2=high, 3=medium)
+  leads.sort((a, b) => a.priority - b.priority);
+  return leads.slice(0, 15);
+}
+
 // Form Analysis - Identify input fields and sensitive forms
 function analyzeForms(html) {
   const forms = [];
@@ -1502,6 +1726,16 @@ function deriveHighlights(state){
   return { items: items.slice(0, 12) };
 }
 
+// Regenerate leads when new data arrives (called alongside highlights)
+async function refreshLeads(tabId) {
+  try {
+    const state = await getTabData(tabId);
+    if (!state) return;
+    const leads = generateLeads(state);
+    if (leads.length) await patchState(tabId, { leads });
+  } catch (e) { logError("Lead refresh failed:", e); }
+}
+
 function scheduleHighlights(tabId){
   if(highlightTimers.has(tabId)) return;
   const timer = setTimeout(async()=>{
@@ -1510,6 +1744,8 @@ function scheduleHighlights(tabId){
       const state = await getTabData(tabId);
       const highlights = deriveHighlights(state);
       if(highlights) await patchState(tabId, { highlights });
+      // Also refresh leads with latest data
+      await refreshLeads(tabId);
     }catch(e){ logError("Highlight generation failed", e); }
   }, 400);
   highlightTimers.set(tabId, timer);
@@ -1560,6 +1796,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await patchState(sender.tab.id, { secrets: merged });
             scheduleHighlights(sender.tab.id);
           }
+
+          // JS deep analysis: endpoints, configs, auth surfaces, parameters
+          (async () => {
+            try {
+              const allJS = (msg.inlineScripts || []).join("\n");
+              // Also fetch external scripts for endpoint extraction
+              const extTexts = await Promise.all(
+                (msg.externalScripts || []).slice(0, 8).map(u => fetchText(u))
+              );
+              const combinedJS = allJS + "\n" + extTexts.join("\n");
+              const combinedHTML = msg.htmlSample || "";
+
+              const jsEndpoints = extractJSEndpoints(combinedJS);
+              const jsConfigs = extractJSConfigs(combinedJS);
+              const currentState = await getTabData(sender.tab.id);
+              const authSurfaces = detectAuthSurfaces(
+                currentState?.forms,
+                [...jsEndpoints, ...(currentState?.waybackUrls || [])],
+                combinedHTML + combinedJS
+              );
+
+              // Extract params from wayback URLs + JS endpoints
+              const allUrls = [
+                ...(currentState?.waybackAll || []),
+                ...jsEndpoints.filter(e => e.includes("?"))
+              ];
+              const discoveredParams = extractParameters(allUrls);
+
+              await patchState(sender.tab.id, {
+                jsEndpoints,
+                jsConfigs,
+                authSurfaces,
+                discoveredParams
+              });
+
+              // Generate leads from all collected data
+              const latestState = await getTabData(sender.tab.id);
+              const leads = generateLeads(latestState);
+              await patchState(sender.tab.id, { leads });
+              scheduleHighlights(sender.tab.id);
+              log(`Lead generation complete: ${leads.length} leads, ${jsEndpoints.length} endpoints, ${discoveredParams.length} params`);
+            } catch (e) {
+              logError("JS deep analysis failed:", e);
+            }
+          })();
         }
         sendResponse({ ok: true });
       } else if (msg?.type === "getState") {

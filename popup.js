@@ -352,6 +352,115 @@ function waybackCard(s) {
   }, false);
 }
 
+// LEADS CARD - The main value proposition
+function leadsCard(s) {
+  if (!s.leads || !s.leads.length) return null;
+  const card = el(`<div class="card" style="border-color:#1976d2;border-width:2px"><h3 style="color:#1976d2">🎯 Attack Leads</h3></div>`);
+  for (const lead of s.leads) {
+    const pColor = lead.priority === 1 ? "#b71c1c" : lead.priority === 2 ? "#e65100" : "#2e7d32";
+    const pLabel = lead.priority === 1 ? "P1 CRITICAL" : lead.priority === 2 ? "P2 HIGH" : "P3 MEDIUM";
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.cssText = "margin:8px 0;padding:8px;border:1px solid #eee;border-radius:6px;border-left:3px solid " + pColor;
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px";
+    const badge = document.createElement("span");
+    badge.className = "chip";
+    badge.style.cssText = `background:${pColor};color:white;font-weight:bold;font-size:9px;padding:1px 6px`;
+    badge.textContent = pLabel;
+    const cat = document.createElement("span");
+    cat.className = "chip";
+    cat.textContent = lead.category;
+    const title = document.createElement("b");
+    title.textContent = lead.title;
+    header.appendChild(badge);
+    header.appendChild(cat);
+    row.appendChild(header);
+
+    const titleDiv = document.createElement("div");
+    titleDiv.style.fontWeight = "bold";
+    titleDiv.style.marginBottom = "2px";
+    titleDiv.textContent = lead.title;
+    row.appendChild(titleDiv);
+
+    const detail = document.createElement("div");
+    detail.className = "small";
+    detail.textContent = lead.detail;
+    row.appendChild(detail);
+
+    if (lead.action) {
+      const actionDiv = document.createElement("div");
+      actionDiv.style.cssText = "margin-top:4px;display:flex;align-items:center;gap:4px";
+      const code = document.createElement("code");
+      code.style.cssText = "font-size:10px;background:#f5f5f5;padding:2px 6px;border-radius:3px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block";
+      code.textContent = lead.action.length > 80 ? lead.action.slice(0, 80) + "…" : lead.action;
+      code.title = lead.action;
+      actionDiv.appendChild(code);
+      actionDiv.appendChild(copyBtn(lead.action, "Copy"));
+      row.appendChild(actionDiv);
+    }
+    card.appendChild(row);
+  }
+  return card;
+}
+
+// JS Endpoints card
+function endpointsCard(s) {
+  if (!s.jsEndpoints || !s.jsEndpoints.length) return null;
+  return collapsible(`🔗 JS Endpoints (${s.jsEndpoints.length})`, body => {
+    body.appendChild(copyBtn(s.jsEndpoints.join("\n"), "Copy All"));
+    for (const ep of s.jsEndpoints.slice(0, 40)) {
+      const isAdmin = /admin|internal|debug|config/i.test(ep);
+      const d = document.createElement("div");
+      d.className = "mono small";
+      d.style.cssText = `margin:2px 0;${isAdmin ? "color:#b71c1c;font-weight:bold" : ""}`;
+      d.textContent = ep;
+      body.appendChild(d);
+    }
+    if (s.jsEndpoints.length > 40) body.appendChild(el(`<div class="small">…and ${s.jsEndpoints.length - 40} more</div>`));
+  }, false);
+}
+
+// Discovered parameters card
+function paramsCard(s) {
+  if (!s.discoveredParams || !s.discoveredParams.length) return null;
+  return collapsible(`🧪 URL Parameters (${s.discoveredParams.length})`, body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">Parameters found across Wayback + JS — test for SQLi, XSS, SSRF, IDOR</div>`));
+    const injectable = /id|user|name|query|search|q|url|redirect|file|path|page|callback|token|ref/i;
+    for (const p of s.discoveredParams.slice(0, 30)) {
+      const hot = injectable.test(p.name);
+      const d = document.createElement("div");
+      d.className = "small";
+      d.style.cssText = `margin:2px 0;padding:2px 4px;border-radius:3px;${hot ? "background:#fff3e0;border-left:2px solid #fb8c00" : ""}`;
+      d.innerHTML = `<code>${esc(p.name)}</code>${hot ? ' <span style="color:#e65100;font-size:9px">⚡ HIGH INTEREST</span>' : ''} ${p.examples.length ? `<span class="small"> e.g. ${p.examples.slice(0,2).map(v=>`<code>${esc(v)}</code>`).join(", ")}</span>` : ""}`;
+      body.appendChild(d);
+    }
+  }, false);
+}
+
+// Auth surfaces card
+function authCard(s) {
+  if (!s.authSurfaces || !s.authSurfaces.length) return null;
+  return collapsible(`🔐 Auth Surfaces (${s.authSurfaces.length})`, body => {
+    for (const auth of s.authSurfaces) {
+      const d = document.createElement("div");
+      d.className = "row";
+      d.style.cssText = "margin:4px 0;padding:6px;border:1px solid #eee;border-radius:4px";
+      const typeSpan = document.createElement("span");
+      typeSpan.className = "chip";
+      typeSpan.style.cssText = auth.risk === "high" ? "background:#ffebee;border-color:#ef5350;color:#b71c1c" : "";
+      typeSpan.textContent = auth.type.replace(/_/g, " ");
+      d.appendChild(typeSpan);
+      const detail = document.createElement("div");
+      detail.className = "small";
+      detail.textContent = `${auth.detail} — ${auth.why}`;
+      d.appendChild(detail);
+      body.appendChild(d);
+    }
+  });
+}
+
 async function render(){
   const root=document.getElementById("root");
   // Preserve scroll position across re-renders
@@ -365,11 +474,19 @@ async function render(){
   const prog = progressCard(s);
   if (prog) root.appendChild(prog);
 
+  // LEADS - the main value: actionable attack paths
+  const lCard = leadsCard(s);
+  if (lCard) root.appendChild(lCard);
+
   root.appendChild(highlightsCard(s));
 
   // Critical findings first: subdomain takeover
   const tkCard = takeoverCard(s);
   if (tkCard) root.appendChild(tkCard);
+
+  // Auth surfaces
+  const aCard = authCard(s);
+  if (aCard) root.appendChild(aCard);
 
   root.appendChild(headersCard(s.headers));
 
@@ -397,6 +514,12 @@ async function render(){
   root.appendChild(mailCard(s));
   root.appendChild(textsCard(s));
   root.appendChild(secretsCard(s));
+
+  // JS endpoints and params
+  const epCard = endpointsCard(s);
+  if (epCard) root.appendChild(epCard);
+  const pmCard = paramsCard(s);
+  if (pmCard) root.appendChild(pmCard);
 
   // Wayback Machine URLs
   const wbCard = waybackCard(s);
