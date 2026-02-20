@@ -23,7 +23,9 @@
     "https://jldc.me/*",
     "https://cve.circl.lu/*",
     "https://services.nvd.nist.gov/*",
-    "https://www.virustotal.com/api/v3/*"
+    "https://www.virustotal.com/api/v3/*",
+    "https://web.archive.org/*",
+    "https://otx.alienvault.com/*"
   ],
   "action": {
     "default_popup": "popup.html"

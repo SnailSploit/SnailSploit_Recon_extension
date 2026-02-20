@@ -6,7 +6,32 @@ function esc(s){ return (s??"").toString().replace(/[&<>"']/g,c=>({"&":"&amp;","
 
 function headerCard(s){
   const fav = (typeof s.faviconHash==="number") ? `<span class="small">favicon mmh3: <code>${s.faviconHash}</code></span>` : "";
-  return el(`<div class="card"><div><b>${esc(s.domain||"")}</b><div class="small">${esc(s.url||"")}</div>${fav}</div></div>`);
+
+  // Domain accumulation stats
+  const ds = s._domainStats;
+  let statsHtml = "";
+  if (ds) {
+    const elapsed = ds.firstSeen ? timeSince(ds.firstSeen) : "";
+    statsHtml = `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+      <span class="chip" style="background:#e3f2fd;border-color:#1976d2;color:#0d47a1" title="Pages browsed on this domain">${ds.totalPages} pages</span>
+      <span class="chip" style="background:#e8f5e9;border-color:#4caf50;color:#2e7d32" title="JS endpoints extracted">${ds.totalEndpoints} endpoints</span>
+      <span class="chip" style="background:#fff3e0;border-color:#fb8c00;color:#e65100" title="Secrets flagged">${ds.totalSecrets} secrets</span>
+      ${ds.totalEmails ? `<span class="chip">${ds.totalEmails} emails</span>` : ""}
+      ${elapsed ? `<span class="chip small" title="Tracking since first visit">${elapsed}</span>` : ""}
+    </div>`;
+  }
+
+  return el(`<div class="card"><div><b>${esc(s.domain||"")}</b><div class="small">${esc(s.url||"")}</div>${fav}${statsHtml}</div></div>`);
+}
+
+function timeSince(ts) {
+  if (!ts || typeof ts !== "number") return "";
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (isNaN(s) || s < 0) return "";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
 }
 function severityStyle(level){
   const map={
@@ -40,6 +65,7 @@ function headersCard(h){
 function ipsCard(s){
   const card=el(`<div class="card"><h3>IPs</h3></div>`);
   const ips=s.ips||[]; if(!ips.length){ card.appendChild(el('<div class="small">loading…</div>')); return card; }
+  card.querySelector("h3").appendChild(copyBtn(ips.join("\n"), "Copy IPs"));
   for(const ip of ips){
     const per=s.perIp?.[ip]||{}; const sh=per.internetdb||{}; const geo=per.ipwhois||{};
     const row = el(`<div class="row">
@@ -87,6 +113,7 @@ function secretsCard(s){
 function subsCard(s){
   const card=el(`<div class="card"><h3>Live Subdomains</h3><div id="subs"></div></div>`); const box=card.querySelector("#subs");
   const subs=s.quickSubs||[]; if(!subs.length){ box.appendChild(el('<div class="small">resolving…</div>')); return card; }
+  card.querySelector("h3").appendChild(copyBtn(subs.map(x=>x.subdomain).join("\n"), "Copy All"));
   for(const it of subs){
     const vt = s.vt?.[it.subdomain];
     const vtHTML = vt ? `<div class="small">VT rep: <b>${esc(vt.reputation??0)}</b> · <code>${esc(JSON.stringify(vt.last_analysis_stats||{}))}</code></div>` : `<button class="btn vt" data-sub="${esc(it.subdomain)}">Enrich with VirusTotal</button>`;
@@ -143,7 +170,7 @@ function securityChecksCard(s){
   if(s.corsFindings && s.corsFindings.length > 0){
     const corsHTML = s.corsFindings.map(c => {
       const severity = c.credentials ? 'critical' : 'high';
-      return `<div class="row" style="margin:4px 0"><span class="chip" style="${severityStyle(severity)}">${c.type.toUpperCase()}</span> <span class="small">${esc(c.detail)}</span></div>`;
+      return `<div class="row" style="margin:4px 0"><span class="chip" style="${severityStyle(severity)}">${(c.type||"cors").toUpperCase()}</span> <span class="small">${esc(c.detail)}</span></div>`;
     }).join('');
     card.appendChild(el(`<div><b>CORS Issues:</b>${corsHTML}</div>`));
   }
@@ -186,7 +213,9 @@ function intelCard(s){
   if(!intel){ card.appendChild(el('<div class="small">analyzing page…</div>')); return card; }
 
   if(intel.emails && intel.emails.length > 0){
-    card.appendChild(el(`<details class="row"><summary><b>Email Addresses (${intel.emails.length})</b></summary><div>${intel.emails.map(e=>`<code>${esc(e)}</code>`).join(" ")}</div></details>`));
+    const emailRow = el(`<details class="row"><summary><b>Email Addresses (${intel.emails.length})</b></summary><div>${intel.emails.map(e=>`<code>${esc(e)}</code>`).join(" ")}</div></details>`);
+    emailRow.querySelector("div").appendChild(copyBtn(intel.emails.join("\n"), "Copy"));
+    card.appendChild(emailRow);
   }
 
   if(intel.phones && intel.phones.length > 0){
@@ -232,15 +261,29 @@ function aiCorrelationCard(s){
     card.appendChild(el('<div class="small">AI analysis running in background... (requires OpenAI API key in Options)</div>'));
     return card;
   }
-  // Parse markdown and display
-  const content = s.aiCorrelation.split('\n').map(line => {
-    if(line.startsWith('###')) return `<h4 style="margin:8px 0 4px 0;font-size:11px">${esc(line.replace(/^###\s*/,''))}</h4>`;
-    if(line.startsWith('##')) return `<h4 style="margin:10px 0 6px 0;font-size:12px;font-weight:bold">${esc(line.replace(/^##\s*/,''))}</h4>`;
-    if(line.startsWith('- ')) return `<div class="small" style="margin-left:12px">• ${esc(line.replace(/^-\s*/,''))}</div>`;
-    if(line.trim()) return `<div class="small">${esc(line)}</div>`;
-    return '';
-  }).join('');
-  card.innerHTML += content;
+  // Parse markdown lines into safe DOM elements (no innerHTML/insertAdjacentHTML)
+  for (const line of s.aiCorrelation.split('\n')) {
+    let node;
+    if (line.startsWith('###')) {
+      node = document.createElement('h4');
+      node.style.cssText = 'margin:8px 0 4px 0;font-size:11px';
+      node.textContent = line.replace(/^###\s*/, '');
+    } else if (line.startsWith('##')) {
+      node = document.createElement('h4');
+      node.style.cssText = 'margin:10px 0 6px 0;font-size:12px;font-weight:bold';
+      node.textContent = line.replace(/^##\s*/, '');
+    } else if (line.startsWith('- ')) {
+      node = document.createElement('div');
+      node.className = 'small';
+      node.style.marginLeft = '12px';
+      node.textContent = '\u2022 ' + line.replace(/^-\s*/, '');
+    } else if (line.trim()) {
+      node = document.createElement('div');
+      node.className = 'small';
+      node.textContent = line;
+    }
+    if (node) card.appendChild(node);
+  }
   return card;
 }
 
@@ -261,14 +304,313 @@ function aiEnhancedSubsCard(s){
   return card;
 }
 
+// Copy-to-clipboard helper
+function copyBtn(text, label="Copy") {
+  const b = document.createElement("button");
+  b.className = "btn"; b.textContent = label; b.style.cssText = "font-size:10px;padding:2px 6px;margin-left:4px";
+  let timer = null;
+  b.addEventListener("click", () => {
+    if (timer) clearTimeout(timer);
+    navigator.clipboard.writeText(text).catch(() => {});
+    b.textContent = "Copied!";
+    timer = setTimeout(() => { b.textContent = label; timer = null; }, 1200);
+  });
+  return b;
+}
+
+// Collapsible card wrapper
+function collapsible(title, contentFn, startOpen=true) {
+  const card = el(`<div class="card"><h3 style="cursor:pointer;user-select:none" class="collapsible-toggle">${title} <span style="float:right;font-size:10px">${startOpen?'▼':'▶'}</span></h3></div>`);
+  const body = document.createElement("div");
+  body.style.display = startOpen ? "block" : "none";
+  contentFn(body);
+  card.appendChild(body);
+  const toggle = card.querySelector(".collapsible-toggle");
+  if (toggle) toggle.addEventListener("click", () => {
+    const open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    const arrow = toggle.querySelector("span");
+    if (arrow) arrow.textContent = open ? "▶" : "▼";
+  });
+  return card;
+}
+
+// Scan progress tracker
+function progressCard(s) {
+  const phases = [
+    { key: "headers", label: "Headers", done: !!s.headers && Object.values(s.headers).some(Boolean) },
+    { key: "ips", label: "IPs", done: Array.isArray(s.ips) },
+    { key: "tlsInfo", label: "TLS", done: s.tlsInfo !== undefined },
+    { key: "corsFindings", label: "CORS", done: s.corsFindings !== undefined },
+    { key: "sensitiveFiles", label: "Files", done: s.sensitiveFiles !== undefined },
+    { key: "dmarc", label: "DMARC", done: !!s.dmarc },
+    { key: "quickSubs", label: "Subdomains", done: Array.isArray(s.quickSubs) && s.quickSubs.length > 0 },
+    { key: "secrets", label: "Secrets", done: Array.isArray(s.secrets) },
+    { key: "waybackUrls", label: "Wayback", done: s.waybackUrls !== undefined },
+    { key: "tech", label: "Tech", done: !!s.tech }
+  ];
+  const done = phases.filter(p => p.done).length;
+  const pct = Math.round((done / phases.length) * 100);
+  const allDone = pct === 100;
+  if (allDone) return null; // Hide when complete
+  const card = el(`<div class="card" style="padding:8px 10px"><div style="display:flex;align-items:center;gap:8px"><b class="small">Scanning… ${pct}%</b><div style="flex:1;height:4px;background:#eee;border-radius:2px;overflow:hidden"><div style="width:${pct}%;height:100%;background:#1976d2;border-radius:2px;transition:width .3s"></div></div></div><div style="margin-top:4px">${phases.map(p => `<span class="chip" style="${p.done?'background:#e8f5e9;border-color:#4caf50;color:#2e7d32':'opacity:0.4'}">${p.label}</span>`).join(" ")}</div></div>`);
+  return card;
+}
+
+// Subdomain takeover card
+function takeoverCard(s) {
+  if (!s.subdomainTakeovers || !s.subdomainTakeovers.length) return null;
+  return collapsible("⚠ Subdomain Takeover", body => {
+    for (const t of s.subdomainTakeovers) {
+      const row = el(`<div class="row" style="background:#ffebee;border:1px solid #ef5350;border-radius:6px;padding:8px;margin:4px 0">
+        <div><b style="color:#b71c1c">${esc(t.subdomain)}</b> → <code>${esc(t.cname)}</code></div>
+        <div class="small">Service: <b>${esc(t.service)}</b> · Confidence: ${esc(t.confidence)}</div>
+      </div>`);
+      body.appendChild(row);
+    }
+  });
+}
+
+// Wayback Machine card
+function waybackCard(s) {
+  if (!s.waybackUrls || !s.waybackUrls.length) return null;
+  return collapsible("🕐 Wayback Machine URLs", body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">${s.waybackUrls.length} interesting historical URLs found${s.waybackAll ? ` (${s.waybackAll.length} total)` : ''}</div>`));
+    const copyAll = copyBtn(s.waybackUrls.join("\n"), "Copy All");
+    body.appendChild(copyAll);
+    for (const u of s.waybackUrls.slice(0, 30)) {
+      body.appendChild(el(`<div class="mono small" style="margin:2px 0;word-break:break-all">${esc(u)}</div>`));
+    }
+    if (s.waybackUrls.length > 30) body.appendChild(el(`<div class="small">…and ${s.waybackUrls.length - 30} more (export to see all)</div>`));
+  }, false);
+}
+
+// LEADS CARD - The main value proposition
+function leadsCard(s) {
+  if (!s.leads || !s.leads.length) return null;
+  const card = el(`<div class="card" style="border-color:#1976d2;border-width:2px"><h3 style="color:#1976d2">🎯 Attack Leads</h3></div>`);
+  for (const lead of s.leads) {
+    const pColor = lead.priority === 1 ? "#b71c1c" : lead.priority === 2 ? "#e65100" : "#2e7d32";
+    const pLabel = lead.priority === 1 ? "P1 CRITICAL" : lead.priority === 2 ? "P2 HIGH" : "P3 MEDIUM";
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.cssText = "margin:8px 0;padding:8px;border:1px solid #eee;border-radius:6px;border-left:3px solid " + pColor;
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:4px";
+    const badge = document.createElement("span");
+    badge.className = "chip";
+    badge.style.cssText = `background:${pColor};color:white;font-weight:bold;font-size:9px;padding:1px 6px`;
+    badge.textContent = pLabel;
+    const cat = document.createElement("span");
+    cat.className = "chip";
+    cat.textContent = lead.category;
+    const title = document.createElement("b");
+    title.textContent = lead.title;
+    header.appendChild(badge);
+    header.appendChild(cat);
+    row.appendChild(header);
+
+    const titleDiv = document.createElement("div");
+    titleDiv.style.fontWeight = "bold";
+    titleDiv.style.marginBottom = "2px";
+    titleDiv.textContent = lead.title;
+    row.appendChild(titleDiv);
+
+    const detail = document.createElement("div");
+    detail.className = "small";
+    detail.textContent = lead.detail;
+    row.appendChild(detail);
+
+    if (lead.action) {
+      const actionDiv = document.createElement("div");
+      actionDiv.style.cssText = "margin-top:4px;display:flex;align-items:center;gap:4px";
+      const code = document.createElement("code");
+      code.style.cssText = "font-size:10px;background:#f5f5f5;padding:2px 6px;border-radius:3px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block";
+      code.textContent = lead.action.length > 80 ? lead.action.slice(0, 80) + "…" : lead.action;
+      code.title = lead.action;
+      actionDiv.appendChild(code);
+      actionDiv.appendChild(copyBtn(lead.action, "Copy"));
+      row.appendChild(actionDiv);
+    }
+    card.appendChild(row);
+  }
+  return card;
+}
+
+// JS Endpoints card
+function endpointsCard(s) {
+  if (!s.jsEndpoints || !s.jsEndpoints.length) return null;
+  return collapsible(`🔗 JS Endpoints (${s.jsEndpoints.length})`, body => {
+    body.appendChild(copyBtn(s.jsEndpoints.join("\n"), "Copy All"));
+    for (const ep of s.jsEndpoints.slice(0, 40)) {
+      const isAdmin = /admin|internal|debug|config/i.test(ep);
+      const d = document.createElement("div");
+      d.className = "mono small";
+      d.style.cssText = `margin:2px 0;${isAdmin ? "color:#b71c1c;font-weight:bold" : ""}`;
+      d.textContent = ep;
+      body.appendChild(d);
+    }
+    if (s.jsEndpoints.length > 40) body.appendChild(el(`<div class="small">…and ${s.jsEndpoints.length - 40} more</div>`));
+  }, false);
+}
+
+// Discovered parameters card
+function paramsCard(s) {
+  if (!s.discoveredParams || !s.discoveredParams.length) return null;
+  return collapsible(`🧪 URL Parameters (${s.discoveredParams.length})`, body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">Parameters found across Wayback + JS — test for SQLi, XSS, SSRF, IDOR</div>`));
+    const injectable = /id|user|name|query|search|q|url|redirect|file|path|page|callback|token|ref/i;
+    for (const p of s.discoveredParams.slice(0, 30)) {
+      const hot = injectable.test(p.name);
+      const d = document.createElement("div");
+      d.className = "small";
+      d.style.cssText = `margin:2px 0;padding:2px 4px;border-radius:3px;${hot ? "background:#fff3e0;border-left:2px solid #fb8c00" : ""}`;
+      const nameCode = document.createElement("code");
+      nameCode.textContent = p.name;
+      d.appendChild(nameCode);
+      if (hot) {
+        const badge = document.createElement("span");
+        badge.style.cssText = "color:#e65100;font-size:9px;margin-left:4px";
+        badge.textContent = "HIGH INTEREST";
+        d.appendChild(badge);
+      }
+      if (p.examples?.length) {
+        const eg = document.createElement("span");
+        eg.className = "small";
+        eg.textContent = " e.g. ";
+        d.appendChild(eg);
+        p.examples.slice(0, 2).forEach((v, i) => {
+          if (i > 0) d.appendChild(document.createTextNode(", "));
+          const c = document.createElement("code");
+          c.textContent = v;
+          d.appendChild(c);
+        });
+      }
+      body.appendChild(d);
+    }
+  }, false);
+}
+
+// Auth surfaces card
+function authCard(s) {
+  if (!s.authSurfaces || !s.authSurfaces.length) return null;
+  return collapsible(`🔐 Auth Surfaces (${s.authSurfaces.length})`, body => {
+    for (const auth of s.authSurfaces) {
+      const d = document.createElement("div");
+      d.className = "row";
+      d.style.cssText = "margin:4px 0;padding:6px;border:1px solid #eee;border-radius:4px";
+      const typeSpan = document.createElement("span");
+      typeSpan.className = "chip";
+      typeSpan.style.cssText = auth.risk === "high" ? "background:#ffebee;border-color:#ef5350;color:#b71c1c" : "";
+      typeSpan.textContent = auth.type.replace(/_/g, " ");
+      d.appendChild(typeSpan);
+      const detail = document.createElement("div");
+      detail.className = "small";
+      detail.textContent = `${auth.detail} — ${auth.why}`;
+      d.appendChild(detail);
+      body.appendChild(d);
+    }
+  });
+}
+
+// Pages visited breadcrumb trail
+function pagesVisitedCard(s) {
+  const pages = s._domainStats?.pagesVisited;
+  if (!pages || pages.length < 2) return null;
+  return collapsible(`📍 Pages Browsed (${pages.length})`, body => {
+    for (const p of [...pages].reverse().slice(0, 20)) {
+      const ago = timeSince(p.ts);
+      const path = p.url.replace(/https?:\/\/[^\/]+/, "") || "/";
+      const d = document.createElement("div");
+      d.className = "small";
+      d.style.cssText = "margin:2px 0;display:flex;justify-content:space-between;gap:8px";
+      const pathSpan = document.createElement("span");
+      pathSpan.className = "mono";
+      pathSpan.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px";
+      pathSpan.textContent = path;
+      pathSpan.title = p.url;
+      const timeSpan = document.createElement("span");
+      timeSpan.style.cssText = "opacity:0.5;white-space:nowrap";
+      timeSpan.textContent = ago;
+      d.appendChild(pathSpan);
+      d.appendChild(timeSpan);
+      body.appendChild(d);
+    }
+  }, false);
+}
+
+// Passive request log card
+function requestLogCard(s) {
+  const reqs = s._requestLog;
+  if (!reqs || reqs.length < 3) return null;
+  const apiReqs = reqs.filter(r => /xmlhttprequest/i.test(r.type) || /\/api|\/v\d|graphql/i.test(r.path));
+  if (!apiReqs.length) return null;
+  return collapsible(`📡 API Calls Observed (${apiReqs.length})`, body => {
+    body.appendChild(el(`<div class="small" style="margin-bottom:6px">Passively captured as you browsed</div>`));
+    body.appendChild(copyBtn(apiReqs.map(r => `${r.method} ${r.path}`).join("\n"), "Copy All"));
+    for (const r of apiReqs.slice(-30).reverse()) {
+      const statusColor = r.status >= 400 ? "#b71c1c" : r.status >= 300 ? "#e65100" : "#2e7d32";
+      const d = document.createElement("div");
+      d.className = "small mono";
+      d.style.cssText = "margin:2px 0;display:flex;gap:6px;align-items:center";
+      const st = document.createElement("span");
+      st.style.cssText = `color:${statusColor};min-width:24px`;
+      st.textContent = r.status || "?";
+      const meth = document.createElement("b");
+      meth.style.minWidth = "34px";
+      meth.textContent = r.method || "?";
+      const pathEl = document.createElement("span");
+      pathEl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      pathEl.title = r.url || "";
+      pathEl.textContent = r.path || "";
+      d.appendChild(st);
+      d.appendChild(meth);
+      d.appendChild(pathEl);
+      if (r.params?.length) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.style.fontSize = "9px";
+        chip.textContent = `${r.params.length} params`;
+        d.appendChild(chip);
+      }
+      body.appendChild(d);
+    }
+  }, false);
+}
+
 async function render(){
-  const root=document.getElementById("root"); const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
+  const root=document.getElementById("root");
+  if (!root) return;
+  try {
+  // Preserve scroll position across re-renders
+  const scrollY = root.parentElement?.scrollTop || 0;
+  const s=await chrome.runtime.sendMessage({type:"getState", tabId:TAB_ID}); root.innerHTML="";
   if(!s){ root.textContent="No data yet. Reload the page."; return; } if(s.error){ root.textContent=`Error: ${s.error}`; return; }
+
   root.appendChild(headerCard(s));
+
+  // Progress bar (auto-hides when complete)
+  const prog = progressCard(s);
+  if (prog) root.appendChild(prog);
+
+  // LEADS - the main value: actionable attack paths
+  const lCard = leadsCard(s);
+  if (lCard) root.appendChild(lCard);
+
   root.appendChild(highlightsCard(s));
+
+  // Critical findings first: subdomain takeover
+  const tkCard = takeoverCard(s);
+  if (tkCard) root.appendChild(tkCard);
+
+  // Auth surfaces
+  const aCard = authCard(s);
+  if (aCard) root.appendChild(aCard);
+
   root.appendChild(headersCard(s.headers));
 
-  // New security analysis cards
+  // Security analysis cards
   if(s.tlsInfo || s.corsFindings || s.httpMethods || s.sensitiveFiles || s.cookieSecurity) {
     if(s.tlsInfo) root.appendChild(tlsCard(s));
     root.appendChild(securityChecksCard(s));
@@ -292,10 +634,34 @@ async function render(){
   root.appendChild(mailCard(s));
   root.appendChild(textsCard(s));
   root.appendChild(secretsCard(s));
+
+  // JS endpoints and params
+  const epCard = endpointsCard(s);
+  if (epCard) root.appendChild(epCard);
+  const pmCard = paramsCard(s);
+  if (pmCard) root.appendChild(pmCard);
+
+  // Wayback Machine URLs
+  const wbCard = waybackCard(s);
+  if (wbCard) root.appendChild(wbCard);
+
   root.appendChild(subsCard(s));
   if(s.aiEnhancedSubs && s.aiEnhancedSubs.length > 0) root.appendChild(aiEnhancedSubsCard(s));
+  // Passive capture cards
+  const reqCard = requestLogCard(s);
+  if (reqCard) root.appendChild(reqCard);
+  const pvCard = pagesVisitedCard(s);
+  if (pvCard) root.appendChild(pvCard);
+
   root.appendChild(externalToolsCard(s));
   root.appendChild(exportCard(s));
+
+  // Restore scroll position
+  if (scrollY > 0) requestAnimationFrame(() => { if (root.parentElement) root.parentElement.scrollTop = scrollY; });
+  } catch (err) {
+    if (root) root.textContent = "Connection error. Try reloading the page.";
+    console.error("Render failed:", err);
+  }
 }
 
 function externalToolsCard(s){
@@ -481,21 +847,17 @@ function exportHTTPX(s){
 }
 
 function showBookmarklet(){
-  const code = `javascript:(function(){
-    const d=document.domain;
-    chrome.runtime.sendMessage('${chrome.runtime.id}', {type:'quickRecon',domain:d}, r=>{
-      alert('SnailSploit Recon started for: '+d);
-    });
-  })();`;
+  // Bookmarklet that performs lightweight inline recon (no extension APIs needed)
+  const code = `javascript:void(function(){var d=document.domain,h=location.href,o='';o+='Domain: '+d+'\\n';o+='URL: '+h+'\\n';var c=document.querySelectorAll('script[src]');o+='External scripts: '+c.length+'\\n';c.forEach(function(s){o+='  '+s.src+'\\n'});var m=document.querySelector('meta[name=generator]');if(m)o+='Generator: '+m.content+'\\n';var f=document.querySelectorAll('form');o+='Forms: '+f.length+'\\n';f.forEach(function(x,i){o+='  '+(x.method||'GET').toUpperCase()+' -> '+(x.action||'(self)')+'\\n'});var e=document.documentElement.outerHTML.match(/[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Z|a-z]{2,}/g);if(e&&e.length)o+='Emails: '+[...new Set(e)].join(', ')+'\\n';var cm=document.documentElement.outerHTML.match(/<!--[\\s\\S]*?-->/g);if(cm)o+='HTML comments: '+cm.length+'\\n';var w=document.createElement('div');w.style.cssText='position:fixed;top:10px;right:10px;z-index:999999;background:#111;color:#0f0;padding:16px;border-radius:8px;font:12px monospace;max-width:500px;max-height:80vh;overflow:auto;white-space:pre-wrap';w.textContent=o;var b=document.createElement('button');b.textContent='Close';b.style.cssText='margin-top:8px;padding:4px 12px;cursor:pointer';b.onclick=function(){w.remove()};w.appendChild(b);document.body.appendChild(w)}())`;
 
   const modal = el(`<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center" id="bookmarkletModal">
     <div style="background:white;padding:24px;border-radius:8px;max-width:600px;width:90%">
       <h3 style="margin-top:0">Quick Recon Bookmarklet</h3>
-      <p class="small">Drag this link to your bookmarks bar, or copy the code:</p>
+      <p class="small">Drag this link to your bookmarks bar, or copy the code. This runs a lightweight page-only recon (no extension required):</p>
       <div style="background:#f5f5f5;padding:12px;border-radius:4px;margin:12px 0;word-break:break-all;font-family:monospace;font-size:11px">
-        <a href="${esc(code)}" style="color:#1976d2;text-decoration:none">⚡ SnailSploit Quick Recon</a>
+        <a href="${esc(code)}" style="color:#1976d2;text-decoration:none">SnailSploit Quick Recon</a>
       </div>
-      <p class="small"><b>Usage:</b> Click the bookmark on any website to instantly trigger reconnaissance.</p>
+      <p class="small"><b>Detects:</b> scripts, forms, emails, HTML comments, generator meta. For full recon, use the extension popup.</p>
       <button class="btn" id="closeModal" style="margin-top:12px">Close</button>
       <button class="btn" id="copyCode" style="margin-top:12px;margin-left:8px">Copy Code</button>
     </div>
@@ -549,6 +911,13 @@ function exportCard(s){
     report += `\nIP Addresses: ${(s.ips||[]).join(', ')}\n`;
     if(s.quickSubs?.length) report += `\nSubdomains (${s.quickSubs.length}):\n${s.quickSubs.map(x=>x.subdomain).join('\n')}\n`;
     if(s.secrets?.length) report += `\nSecrets Found: ${s.secrets.length} sources\n`;
+    if(s.waybackUrls?.length) report += `\nWayback Machine URLs (${s.waybackUrls.length} interesting):\n${s.waybackUrls.join('\n')}\n`;
+    if(s.subdomainTakeovers?.length) report += `\nSubdomain Takeovers:\n${s.subdomainTakeovers.map(t=>`${t.subdomain} → ${t.service} (${t.cname})`).join('\n')}\n`;
+    if(s.jsEndpoints?.length) report += `\nJS Endpoints (${s.jsEndpoints.length}):\n${s.jsEndpoints.join('\n')}\n`;
+    if(s.authSurfaces?.length) report += `\nAuth Surfaces:\n${s.authSurfaces.map(a=>`${a.type}: ${a.detail}`).join('\n')}\n`;
+    if(s._requestLog?.length) report += `\nPassive Request Log (${s._requestLog.length}):\n${s._requestLog.map(r=>`${r.method} ${r.status} ${r.url}`).join('\n')}\n`;
+    if(s._domainStats?.pagesVisited?.length) report += `\nPages Browsed (${s._domainStats.pagesVisited.length}):\n${s._domainStats.pagesVisited.map(p=>p.url).join('\n')}\n`;
+    if(s.leads?.length) report += `\nAttack Leads:\n${s.leads.map(l=>`[P${l.priority}] ${l.category}: ${l.title} — ${l.detail}`).join('\n')}\n`;
     const blob = new Blob([report], {type: 'text/plain'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -560,8 +929,16 @@ function exportCard(s){
   return card;
 }
 
+// Debounce render to prevent flickering from rapid state updates
+let renderTimer = null;
+function debouncedRender() {
+  if (renderTimer) clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => { renderTimer = null; render(); }, 250);
+}
+window.addEventListener("unload", () => { if (renderTimer) clearTimeout(renderTimer); });
+
 (async()=>{
   TAB_ID=await getTabId();
   await render();
-  chrome.storage.onChanged.addListener((changes, area) => { if(area!=="session") return; const key=`tab:${TAB_ID}`; if(changes[key]) render(); });
+  chrome.storage.onChanged.addListener((changes, area) => { if(area!=="session") return; const key=`tab:${TAB_ID}`; if(changes[key]) debouncedRender(); });
 })();

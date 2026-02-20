@@ -27,7 +27,10 @@ const CONFIG = {
     MAX_CVE_RESULTS: 60,
     MAX_SOURCE_MAPS: 6,
     MAX_DKIM_SELECTORS: 6,
-    MAX_DOM_PATHS: 200
+    MAX_DOM_PATHS: 200,
+    MAX_PAGES_TRACKED: 100,
+    MAX_REQUESTS_LOGGED: 200,
+    MAX_DOMAIN_STORE_SIZE: 500000 // ~500KB per domain
   },
   RETRY: {
     MAX_ATTEMPTS: 3,
@@ -43,10 +46,190 @@ const CONFIG = {
 
 function log(...a){ try{ console.log("[SnailSploit Recon]", ...a);}catch{} }
 function logError(...a){ try{ console.error("[SnailSploit Recon ERROR]", ...a);}catch{} }
-const merge = (a,b)=>Object.assign({},a||{},b||{});
+function merge(a, b) {
+  const result = Object.assign({}, a || {});
+  for (const [key, val] of Object.entries(b || {})) {
+    if (val !== null && typeof val === 'object' && !Array.isArray(val) &&
+        result[key] !== null && typeof result[key] === 'object' && !Array.isArray(result[key])) {
+      result[key] = merge(result[key], val);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
 const dohCache = new Map();
 const subdomainCache = new Map();
 const highlightTimers = new Map();
+
+// ============ DOMAIN-LEVEL PERSISTENT STORE ============
+// Accumulates findings across pages, tabs, and sessions for a target domain.
+// While tab state (session storage) shows the current page, domain state
+// (local storage) builds a complete picture as the user browses.
+
+const domainStoreKey = (domain) => `domain:${domain}`;
+
+async function getDomainData(domain) {
+  try {
+    const key = domainStoreKey(domain);
+    return (await chrome.storage.local.get(key))[key] || null;
+  } catch (e) { logError("getDomainData failed:", e); return null; }
+}
+
+async function setDomainData(domain, data) {
+  try {
+    const key = domainStoreKey(domain);
+    data._lastUpdated = Date.now();
+    await chrome.storage.local.set({ [key]: data });
+  } catch (e) {
+    if (String(e).includes('QUOTA') || String(e).includes('quota')) {
+      // Prune oldest domain stores to make room
+      const all = await chrome.storage.local.get(null);
+      const domains = Object.entries(all)
+        .filter(([k]) => k.startsWith("domain:"))
+        .sort(([,a],[,b]) => (a._lastUpdated||0) - (b._lastUpdated||0));
+      if (domains.length > 5) {
+        await chrome.storage.local.remove(domains.slice(0, 3).map(([k]) => k));
+        log("Pruned 3 oldest domain stores for quota");
+        try { await chrome.storage.local.set({ [domainStoreKey(domain)]: data }); } catch {}
+      }
+    } else { logError("setDomainData failed:", e); }
+  }
+}
+
+// Merge new findings into the domain's persistent store.
+// Arrays are union-merged (deduplicated), objects are deep-merged.
+function mergeUnique(existing, incoming, keyFn) {
+  if (!existing || !existing.length) return incoming || [];
+  if (!incoming || !incoming.length) return existing;
+  const seen = new Set(existing.map(keyFn).filter(Boolean));
+  const merged = [...existing];
+  for (const item of incoming) {
+    const k = keyFn(item);
+    if (k && !seen.has(k)) { seen.add(k); merged.push(item); }
+  }
+  return merged;
+}
+
+async function accumulateToDomain(domain, tabState) {
+  if (!domain || !tabState) return;
+  const existing = await getDomainData(domain) || {
+    domain,
+    firstSeen: Date.now(),
+    pagesVisited: [],
+    requestLog: [],
+    allEndpoints: [],
+    allParams: [],
+    allSecrets: [],
+    allEmails: [],
+    allForms: [],
+    allTech: [],
+    allCookies: [],
+    jsEndpoints: [],
+    authSurfaces: [],
+    jsConfigs: [],
+    subdomainTakeovers: [],
+    waybackUrls: [],
+    waybackAll: [],
+    discoveredParams: [],
+    leads: []
+  };
+
+  // Track page visit
+  const page = tabState.url;
+  if (page && !existing.pagesVisited.some(p => p.url === page)) {
+    existing.pagesVisited.push({
+      url: page,
+      ts: Date.now(),
+      title: tabState.pageTitle || null
+    });
+    if (existing.pagesVisited.length > CONFIG.LIMITS.MAX_PAGES_TRACKED) {
+      existing.pagesVisited = existing.pagesVisited.slice(-CONFIG.LIMITS.MAX_PAGES_TRACKED);
+    }
+  }
+
+  // Accumulate secrets (deduplicate by source)
+  existing.allSecrets = mergeUnique(existing.allSecrets, tabState.secrets, s => s.source);
+
+  // Accumulate subdomains
+  existing.quickSubs = mergeUnique(existing.quickSubs, tabState.quickSubs, s => s?.subdomain);
+
+  // Accumulate JS endpoints
+  if (tabState.jsEndpoints?.length) {
+    const epSet = new Set(existing.jsEndpoints || []);
+    for (const ep of tabState.jsEndpoints) epSet.add(ep);
+    existing.jsEndpoints = [...epSet].slice(0, 500);
+  }
+
+  // Accumulate auth surfaces
+  existing.authSurfaces = mergeUnique(existing.authSurfaces, tabState.authSurfaces, a => `${a.type}:${a.detail}`);
+
+  // Accumulate JS configs
+  existing.jsConfigs = mergeUnique(existing.jsConfigs, tabState.jsConfigs, c => c.match);
+
+  // Accumulate emails
+  if (tabState.intel?.emails?.length) {
+    const emailSet = new Set(existing.allEmails || []);
+    for (const e of tabState.intel.emails) emailSet.add(e);
+    existing.allEmails = [...emailSet];
+  }
+
+  // Accumulate forms (deduplicate by action+method)
+  existing.allForms = mergeUnique(existing.allForms, tabState.forms, f => `${f.method}:${f.action}`);
+
+  // Accumulate tech tags
+  if (tabState.tech?.tags) {
+    const techSet = new Set(existing.allTech || []);
+    for (const t of tabState.tech.tags) techSet.add(t);
+    existing.allTech = [...techSet];
+  }
+
+  // Accumulate cookies
+  existing.allCookies = mergeUnique(existing.allCookies, tabState.cookieSecurity, c => c.name);
+
+  // Accumulate takeovers
+  existing.subdomainTakeovers = mergeUnique(
+    existing.subdomainTakeovers, tabState.subdomainTakeovers, t => t.subdomain
+  );
+
+  // Accumulate wayback URLs
+  if (tabState.waybackUrls?.length) {
+    const wbSet = new Set(existing.waybackUrls || []);
+    for (const u of tabState.waybackUrls) wbSet.add(u);
+    existing.waybackUrls = [...wbSet].slice(0, 200);
+  }
+
+  // Accumulate discovered params
+  existing.discoveredParams = mergeUnique(
+    existing.discoveredParams, tabState.discoveredParams, p => p.name
+  );
+
+  // Copy over one-time fields (latest wins)
+  if (tabState.headers) existing.headers = tabState.headers;
+  if (tabState.ips) existing.ips = tabState.ips;
+  if (tabState.perIp) existing.perIp = merge(existing.perIp || {}, tabState.perIp);
+  if (tabState.tlsInfo) existing.tlsInfo = tabState.tlsInfo;
+  if (tabState.corsFindings) existing.corsFindings = tabState.corsFindings;
+  if (tabState.sensitiveFiles) existing.sensitiveFiles = tabState.sensitiveFiles;
+  if (tabState.httpMethods) existing.httpMethods = tabState.httpMethods;
+  if (tabState.dmarc) existing.dmarc = tabState.dmarc;
+  if (tabState.spf) existing.spf = tabState.spf;
+  if (tabState.waf) existing.waf = tabState.waf;
+
+  // Re-generate leads from accumulated data
+  existing.leads = generateLeads(existing);
+
+  // Stats
+  existing.totalPages = existing.pagesVisited.length;
+  existing.totalEndpoints = (existing.jsEndpoints || []).length;
+  existing.totalSecrets = (existing.allSecrets || []).length;
+
+  await setDomainData(domain, existing);
+  return existing;
+}
+
+// Track tab → domain mapping so we know which domain each tab is on
+const tabDomainMap = new Map();
 function setBoundedCache(map, key, value){
   map.set(key, value);
   if (map.size > CONFIG.CACHE.MAX_ENTRIES) {
@@ -89,9 +272,73 @@ chrome.webRequest.onHeadersReceived.addListener((d)=>{
   headersByTab.set(d.tabId, { url: d.url, responseHeaders: d.responseHeaders || [] });
 }, { urls: ["<all_urls>"] }, ["responseHeaders","extraHeaders"]);
 
+// Passive request logger - captures API calls, XHR, fetches as user browses
+const requestLogByDomain = new Map();
+chrome.webRequest.onCompleted.addListener((d) => {
+  if (d.tabId < 0) return; // Ignore non-tab requests
+  const domain = tabDomainMap.get(d.tabId);
+  if (!domain) return;
+
+  // Only log interesting request types (skip images, fonts, CSS)
+  const dominated = ["xmlhttprequest", "script", "sub_frame", "other"];
+  if (!dominated.includes(d.type)) return;
+
+  try {
+    const urlObj = new URL(d.url);
+    const entry = {
+      url: d.url,
+      path: urlObj.pathname,
+      method: d.method || "GET",
+      type: d.type,
+      status: d.statusCode,
+      ts: Date.now()
+    };
+
+    // Extract query parameters
+    if (urlObj.search) {
+      entry.params = [...urlObj.searchParams.keys()].slice(0, 20);
+    }
+
+    if (!requestLogByDomain.has(domain)) requestLogByDomain.set(domain, []);
+    const log_arr = requestLogByDomain.get(domain);
+    // Deduplicate by path+method
+    if (!log_arr.some(e => e.path === entry.path && e.method === entry.method)) {
+      log_arr.push(entry);
+      if (log_arr.length > CONFIG.LIMITS.MAX_REQUESTS_LOGGED) log_arr.shift();
+    }
+  } catch {}
+}, { urls: ["<all_urls>"] });
+
+// Also capture redirects passively
+chrome.webRequest.onBeforeRedirect.addListener((d) => {
+  if (d.tabId < 0) return;
+  const domain = tabDomainMap.get(d.tabId);
+  if (!domain) return;
+  try {
+    if (!requestLogByDomain.has(domain)) requestLogByDomain.set(domain, []);
+    const log_arr = requestLogByDomain.get(domain);
+    log_arr.push({
+      url: d.url,
+      redirectUrl: d.redirectUrl,
+      method: d.method || "GET",
+      type: "redirect",
+      status: d.statusCode,
+      ts: Date.now()
+    });
+    if (log_arr.length > CONFIG.LIMITS.MAX_REQUESTS_LOGGED) log_arr.shift();
+  } catch {}
+}, { urls: ["<all_urls>"] });
+
 function pickSecurityHeaders(tabId){
   const rec = headersByTab.get(tabId); if (!rec) return null;
-  const h = {}; for (const {name,value} of rec.responseHeaders||[]) h[name.toLowerCase()] = value || "";
+  const h = {}; const setCookies = [];
+  for (const {name,value} of rec.responseHeaders||[]) {
+    const lc = name.toLowerCase();
+    if (lc === "set-cookie") { setCookies.push(value || ""); }
+    else { h[lc] = value || ""; }
+  }
+  // Preserve all Set-Cookie headers as an array
+  if (setCookies.length) h["set-cookie"] = setCookies;
   const get = k => h[k] || null;
   return { url: rec.url, headers: {
     "content-security-policy": get("content-security-policy"),
@@ -103,12 +350,13 @@ function pickSecurityHeaders(tabId){
     "server": get("server"),
     "alt-svc": get("alt-svc"),
     "x-powered-by": get("x-powered-by"),
-    "via": get("via")
+    "via": get("via"),
+    "set-cookie": setCookies.length ? setCookies : null
   }};
 }
 async function fetchHeadersFallback(url){
-  try{ const r=await fetchWithTimeout(url,{method:"HEAD"},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch{}
-  try{ const r=await fetchWithTimeout(url,{method:"GET",headers:{"Range":"bytes=0-0"}},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch{}
+  try{ const r=await fetchWithTimeout(url,{method:"HEAD"},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch(e){ log(`HEAD fallback failed for ${url}:`, e.message); }
+  try{ const r=await fetchWithTimeout(url,{method:"GET",headers:{"Range":"bytes=0-0"}},2500); const o={}; for(const [k,v] of r.headers.entries()) o[k.toLowerCase()]=v; return o; }catch(e){ log(`GET-Range fallback failed for ${url}:`, e.message); }
   return null;
 }
 
@@ -133,7 +381,7 @@ async function dohResolve(name, type){
         setBoundedCache(dohCache, key, { ts: now, ans: j.Answer });
         return j.Answer;
       }
-    } catch {}
+    } catch (e) { log(`DoH resolver failed (${u}):`, e.message); }
   }
   setBoundedCache(dohCache, key, { ts: now, ans: [] });
   return [];
@@ -164,6 +412,12 @@ async function resolveIPs(hostname){
 async function fetchJSON(url, opts = {}, timeout = CONFIG.TIMEOUTS.FETCH_JSON) {
   return retryWithBackoff(async () => {
     const r = await fetchWithTimeout(url, { ...opts }, timeout);
+    if (r.status === 429) {
+      const retryAfter = parseInt(r.headers.get('retry-after') || '5', 10);
+      log(`Rate limited (429) on ${url}, waiting ${retryAfter}s`);
+      await new Promise(res => setTimeout(res, retryAfter * 1000));
+      throw new Error(`Rate limited (429) for ${url}`);
+    }
     if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
     return r.json();
   }, 2, `fetchJSON(${url})`);
@@ -255,32 +509,20 @@ async function subdomainsPassive(domain){
 
   // Fetch from all sources in parallel for maximum speed
   const sources = await Promise.allSettled([
-    // crt.sh - certificate transparency logs
+    // crt.sh - certificate transparency logs (uses shared cache)
     (async () => {
       try {
         log(`Fetching subdomains from crt.sh for ${q}...`);
-        const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
-        if (r.ok) {
-          const t = await r.text();
-          let arr = [];
-          try {
-            arr = JSON.parse(t);
-          } catch {
-            // Handle NDJSON format
-            arr = t.trim().split("\n").map(x => {
-              try { return JSON.parse(x); } catch { return null; }
-            }).filter(Boolean);
+        const arr = await fetchCrtshData(q);
+        const results = [];
+        for (const row of arr) {
+          const names = String(row.name_value || "").split(/\n+/);
+          for (const n of names) {
+            if (n && n.endsWith(q)) results.push(n.replace(/^\*\./, ""));
           }
-          const results = [];
-          for (const row of arr) {
-            const names = String(row.name_value || "").split(/\n+/);
-            for (const n of names) {
-              if (n && n.endsWith(q)) results.push(n.replace(/^\*\./, ""));
-            }
-          }
-          log(`crt.sh found ${results.length} subdomains`);
-          return results;
         }
+        log(`crt.sh found ${results.length} subdomains`);
+        return results;
       } catch (e) {
         logError(`crt.sh lookup failed for ${q}:`, e);
       }
@@ -330,6 +572,27 @@ async function subdomainsPassive(domain){
         logError(`Anubis lookup failed for ${q}:`, e);
       }
       return [];
+    })(),
+
+    // AlienVault OTX - passive DNS aggregator (4th source)
+    (async () => {
+      try {
+        log(`Fetching subdomains from AlienVault OTX for ${q}...`);
+        const r = await fetchWithTimeout(`https://otx.alienvault.com/api/v1/indicators/domain/${encodeURIComponent(q)}/passive_dns`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+        if (r.ok) {
+          const j = await r.json();
+          const results = [];
+          for (const entry of (j.passive_dns || [])) {
+            const h = (entry.hostname || "").trim();
+            if (h && h.endsWith(q) && h !== q) results.push(h);
+          }
+          log(`AlienVault OTX found ${results.length} subdomains`);
+          return results;
+        }
+      } catch (e) {
+        logError(`AlienVault OTX lookup failed for ${q}:`, e);
+      }
+      return [];
     })()
   ]);
 
@@ -348,7 +611,7 @@ async function subdomainsPassive(domain){
 
 async function subdomainsLive(domain){
   const passive=await subdomainsPassive(domain); const out=[]; const queue=passive.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_QUEUE); const limit=CONFIG.LIMITS.MAX_PARALLEL_WORKERS;
-  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6}); }catch{} } }
+  async function worker(){ while(queue.length){ const s=queue.shift(); try{ const a4=(await dohResolve(s,"A")).filter(x=>x.type===1).map(x=>x.data); const a6=(await dohResolve(s,"AAAA")).filter(x=>x.type===28).map(x=>x.data); const cnames=(await dohResolve(s,"A")).filter(x=>x.type===5).map(x=>x.data?.replace(/\.$/,"")); if(a4.length||a6.length) out.push({subdomain:s,a:a4,aaaa:a6,cnames}); }catch(e){ log(`DNS resolve failed for ${s}:`, e.message); } } }
   await Promise.all(Array.from({length:limit},worker)); return out.slice(0,CONFIG.LIMITS.MAX_SUBDOMAINS_LIVE);
 }
 
@@ -370,19 +633,50 @@ function mmh3_32_from_b64(b64){
 // Fetches favicon and computes its mmh3 hash for fingerprinting
 async function faviconHash(url){ try{ const r=await fetchWithTimeout(url,{},CONFIG.TIMEOUTS.FETCH_FAVICON); if(!r.ok) return null; const buf=await r.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf))); return mmh3_32_from_b64(b64);}catch{ return null; }}
 
-// TLS/SSL Certificate Analysis - Extract certificate details for security assessment
+// Shared crt.sh data cache to avoid duplicate API calls
+const crtshCache = new Map();
+
+async function fetchCrtshData(hostname) {
+  const q = hostname.replace(/^\*\./, "");
+  if (crtshCache.has(q)) return crtshCache.get(q);
+
+  try {
+    log(`Fetching crt.sh data for ${q}...`);
+    const r = await fetchWithTimeout(`https://crt.sh/?q=%25.${encodeURIComponent(q)}&output=json`, {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE);
+    if (!r.ok) { crtshCache.set(q, []); return []; }
+
+    const t = await r.text();
+    let arr = [];
+    try {
+      arr = JSON.parse(t);
+    } catch {
+      arr = t.trim().split("\n").map(x => {
+        try { return JSON.parse(x); } catch { return null; }
+      }).filter(Boolean);
+    }
+    crtshCache.set(q, arr);
+    return arr;
+  } catch (e) {
+    logError(`crt.sh fetch failed for ${q}:`, e);
+    crtshCache.set(q, []);
+    return [];
+  }
+}
+
+// TLS/SSL Certificate Analysis - Extract certificate details from shared crt.sh data
 async function getTLSInfo(hostname) {
   try {
-    log(`Fetching TLS certificate info for ${hostname}...`);
-    // Use crt.sh API to get certificate details
-    const r = await fetchWithTimeout(`https://crt.sh/?q=${encodeURIComponent(hostname)}&output=json`, {}, CONFIG.TIMEOUTS.FETCH_JSON);
-    if (!r.ok) return null;
-
-    const certs = await r.json();
+    log(`Extracting TLS certificate info for ${hostname}...`);
+    const certs = await fetchCrtshData(hostname);
     if (!Array.isArray(certs) || certs.length === 0) return null;
 
-    // Get the most recent cert
-    const latest = certs.sort((a, b) => new Date(b.entry_timestamp) - new Date(a.entry_timestamp))[0];
+    // Get the most recent cert for the exact hostname (not wildcard subdomains)
+    const relevant = certs.filter(c => {
+      const names = String(c.name_value || "").split(/\n+/);
+      return names.some(n => n.trim() === hostname || n.trim() === `*.${hostname}`);
+    });
+    const pool = relevant.length ? relevant : certs;
+    const latest = pool.sort((a, b) => new Date(b.entry_timestamp) - new Date(a.entry_timestamp))[0];
 
     // Parse SANs (Subject Alternative Names) for subdomain intel
     const sans = new Set();
@@ -402,8 +696,39 @@ async function getTLSInfo(hostname) {
       commonName: latest.common_name
     };
   } catch (e) {
-    logError(`TLS info fetch failed for ${hostname}:`, e);
+    logError(`TLS info extraction failed for ${hostname}:`, e);
     return null;
+  }
+}
+
+// Wayback Machine URL Discovery - Finds historical URLs for the target domain
+// Reveals old endpoints, forgotten admin panels, API routes, and URL parameters
+async function waybackUrls(domain) {
+  try {
+    log(`Fetching Wayback Machine URLs for ${domain}...`);
+    const r = await fetchWithTimeout(
+      `https://web.archive.org/cdx/search/cdx?url=*.${encodeURIComponent(domain)}/*&output=json&fl=original&collapse=urlkey&limit=200`,
+      {}, CONFIG.TIMEOUTS.SUBDOMAIN_PASSIVE
+    );
+    if (!r.ok) return [];
+    const rows = await r.json();
+    // First row is header ["original"], skip it
+    const urls = new Set();
+    for (let i = 1; i < rows.length; i++) {
+      const u = rows[i]?.[0];
+      if (u && typeof u === "string") urls.add(u);
+    }
+    // Deduplicate by path (strip query string for grouping, but keep full URL)
+    const unique = [...urls].slice(0, 150);
+    log(`Wayback Machine found ${unique.length} unique URLs for ${domain}`);
+    // Extract interesting patterns: admin, api, config, backup, login, upload
+    const interesting = unique.filter(u =>
+      /\b(admin|api|login|upload|config|backup|dashboard|debug|internal|console|panel|phpinfo|wp-admin|.env|graphql|swagger)\b/i.test(u)
+    );
+    return { all: unique, interesting: interesting.slice(0, 50) };
+  } catch (e) {
+    logError(`Wayback Machine lookup failed for ${domain}:`, e);
+    return { all: [], interesting: [] };
   }
 }
 
@@ -435,7 +760,7 @@ async function checkCORS(url) {
         } else if (acao === 'null') {
           findings.push({ type: 'null_origin', detail: 'ACAO: null (sandbox bypass risk)' });
         }
-      } catch {}
+      } catch (e) { log(`CORS probe failed for origin ${origin}:`, e.message); }
     }
 
     return findings.length > 0 ? findings : null;
@@ -472,58 +797,71 @@ async function probeHTTPMethods(url) {
 }
 
 // Sensitive File/Directory Probing - Check for exposed sensitive files
+// Uses content-type validation and soft-404 detection to reduce false positives
 async function probeSensitiveFiles(origin) {
   const sensitiveFiles = [
-    '/.git/config',
-    '/.git/HEAD',
-    '/.env',
-    '/.env.local',
-    '/.env.production',
-    '/config.json',
-    '/package.json',
-    '/composer.json',
-    '/web.config',
-    '/.htaccess',
-    '/phpinfo.php',
-    '/server-status',
-    '/admin',
-    '/.well-known/security.txt',
-    '/backup.zip',
-    '/backup.tar.gz',
-    '/database.sql',
-    '/db.sql',
-    '/.DS_Store',
-    '/Dockerfile',
-    '/.dockerignore',
-    '/docker-compose.yml',
-    '/.gitlab-ci.yml',
-    '/.github/workflows',
-    '/swagger.json',
-    '/api-docs',
-    '/graphql',
-    '/.svn/entries'
+    { path: '/.git/config', expectedType: /text|octet-stream/, marker: '[core]' },
+    { path: '/.git/HEAD', expectedType: /text|octet-stream/, marker: 'ref:' },
+    { path: '/.env', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/.env.local', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/.env.production', expectedType: /text|octet-stream/, marker: '=' },
+    { path: '/package.json', expectedType: /json/, marker: '"name"' },
+    { path: '/composer.json', expectedType: /json/, marker: '"require"' },
+    { path: '/web.config', expectedType: /xml|text/, marker: '<configuration' },
+    { path: '/.htaccess', expectedType: /text|octet-stream/, marker: null },
+    { path: '/phpinfo.php', expectedType: /html/, marker: 'phpinfo' },
+    { path: '/server-status', expectedType: /html|text/, marker: 'Apache' },
+    { path: '/backup.zip', expectedType: /zip|octet-stream/, marker: null },
+    { path: '/database.sql', expectedType: /sql|text|octet-stream/, marker: null },
+    { path: '/.DS_Store', expectedType: /octet-stream/, marker: null },
+    { path: '/Dockerfile', expectedType: /text|octet-stream/, marker: 'FROM' },
+    { path: '/docker-compose.yml', expectedType: /yaml|text|octet-stream/, marker: 'services' },
+    { path: '/swagger.json', expectedType: /json/, marker: '"swagger"' },
+    { path: '/graphql', expectedType: /json|html/, marker: null },
+    { path: '/.svn/entries', expectedType: /text|xml|octet-stream/, marker: null }
   ];
 
   const found = [];
-  const checks = sensitiveFiles.slice(0, 25).map(async (path) => {
-    try {
-      const url = new URL(path, origin).href;
-      const r = await fetchWithTimeout(url, { method: 'HEAD' }, 2000);
+  // Rate-limited: batch in groups of 5 with small delay to avoid WAF triggers
+  for (let i = 0; i < sensitiveFiles.length; i += 5) {
+    const batch = sensitiveFiles.slice(i, i + 5);
+    const checks = batch.map(async ({ path, expectedType, marker }) => {
+      try {
+        const url = new URL(path, origin).href;
+        // Use GET with small range to validate content, not just HEAD (which can lie)
+        const r = await fetchWithTimeout(url, { method: 'GET' }, 2500);
 
-      if (r.ok) {
+        if (!r.ok) return;
+
+        const ct = r.headers.get('content-type') || '';
         const size = r.headers.get('content-length');
+
+        // Skip if content-type is HTML for non-HTML expected files (likely a custom 404 page)
+        if (expectedType && !expectedType.test(ct) && /text\/html/i.test(ct)) return;
+
+        // Read a small sample for marker validation
+        const body = await r.text();
+        const sample = body.slice(0, 2000);
+
+        // Soft-404 detection: skip if response looks like a generic error page
+        if (/text\/html/i.test(ct) && /(?:404|not found|page not found|error|does not exist)/i.test(sample) && !marker) return;
+
+        // If a marker is specified, verify it exists in the response
+        if (marker && !sample.includes(marker)) return;
+
         found.push({
           path: path,
           status: r.status,
-          size: size ? parseInt(size) : null,
-          contentType: r.headers.get('content-type')
+          size: size ? parseInt(size) : body.length,
+          contentType: ct
         });
-        log(`Found exposed file: ${path} (${r.status})`);
-      }
-    } catch {}
-  });
-
-  await Promise.all(checks);
+        log(`Confirmed exposed file: ${path} (${r.status}, ct: ${ct})`);
+      } catch (e) { log(`Probe ${path} failed:`, e.message); }
+    });
+    await Promise.all(checks);
+    // Small delay between batches to avoid aggressive scanning detection
+    if (i + 5 < sensitiveFiles.length) await new Promise(r => setTimeout(r, 200));
+  }
   return found.length > 0 ? found : null;
 }
 
@@ -537,17 +875,17 @@ function extractIntelFromText(html) {
   };
 
   // Email extraction
-  const emailRx = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+  const emailRx = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
   const emails = html.match(emailRx);
   if (emails) emails.forEach(e => intel.emails.add(e.toLowerCase()));
 
-  // Phone number extraction (various formats)
-  const phoneRx = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})/g;
+  // Phone number extraction (international formats: US, UK, EU, intl prefix)
+  const phoneRx = /(?:\+\d{1,3}[-.\s]?)?\(?([0-9]{2,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})/g;
   const phones = html.match(phoneRx);
-  if (phones) phones.forEach(p => intel.phones.add(p));
+  if (phones) phones.filter(p => p.replace(/\D/g, '').length >= 7).forEach(p => intel.phones.add(p));
 
-  // Social media links
-  const socialRx = /(https?:\/\/)?(www\.)?(twitter|linkedin|facebook|github|instagram|youtube)\.com\/[A-Za-z0-9_\-\.\/]+/gi;
+  // Social media links (updated: includes x.com, tiktok, mastodon, threads)
+  const socialRx = /https?:\/\/(?:www\.)?(?:twitter\.com|x\.com|linkedin\.com|facebook\.com|github\.com|instagram\.com|youtube\.com|tiktok\.com|mastodon\.social|threads\.net)\/[@A-Za-z0-9_\-\.\/]+/gi;
   const social = html.match(socialRx);
   if (social) social.forEach(s => intel.socialLinks.add(s));
 
@@ -611,6 +949,233 @@ async function checkSubdomainTakeover(subdomain, cnames) {
   return null;
 }
 
+// ============ LEAD GENERATION ENGINE ============
+// Extracts actionable intelligence that tells pentesters WHERE to look
+
+// Extract API endpoints, routes, and interesting URLs from JavaScript source
+function extractJSEndpoints(jsText) {
+  if (!jsText) return [];
+  const endpoints = new Set();
+  const apiPatterns = [
+    // Fetch/XHR calls: fetch("/api/users"), axios.get("/v1/data")
+    /(?:fetch|axios\.(?:get|post|put|delete|patch)|\.ajax|\.open)\s*\(\s*["'`](\/[^"'`\s]{3,})/gi,
+    // Route definitions: router.get("/users/:id"), app.post("/api")
+    /(?:router|app|server)\.(?:get|post|put|delete|patch|all|use)\s*\(\s*["'`](\/[^"'`\s]{3,})/gi,
+    // String assignments that look like API paths
+    /(?:url|endpoint|path|route|api|href|action|src)\s*[:=]\s*["'`](\/(?:api|v\d|graphql|auth|admin|user|account|dashboard|internal|ws|socket)[^"'`\s]*)/gi,
+    // Full URL patterns pointing to APIs
+    /["'`](https?:\/\/[^"'`\s]*\/(?:api|v\d|graphql|auth|admin|internal|ws)[^"'`\s]*)/gi,
+    // GraphQL operations
+    /(?:query|mutation|subscription)\s+(\w+)\s*[\({]/g,
+    // Webpack/build config API base URLs
+    /(?:BASE_URL|API_URL|BACKEND|SERVER_URL|API_HOST|API_BASE)\s*[:=]\s*["'`]([^"'`\s]+)/gi,
+  ];
+  for (const rx of apiPatterns) {
+    rx.lastIndex = 0;
+    let m;
+    while ((m = rx.exec(jsText)) !== null) {
+      const ep = m[1];
+      if (ep && ep.length > 2 && ep.length < 200) endpoints.add(ep);
+    }
+  }
+  return [...endpoints];
+}
+
+// Extract URL parameters for injection testing
+function extractParameters(urls) {
+  const params = new Map(); // param name → Set of example values
+  for (const url of urls) {
+    try {
+      const u = new URL(url, "https://placeholder.test");
+      for (const [k, v] of u.searchParams) {
+        if (!params.has(k)) params.set(k, new Set());
+        if (v && v.length < 100) params.get(k).add(v);
+      }
+    } catch {}
+  }
+  // Convert to array sorted by frequency (most-seen params first)
+  return [...params.entries()]
+    .map(([name, values]) => ({ name, examples: [...values].slice(0, 3), count: values.size }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 40);
+}
+
+// Detect login/auth surfaces from forms, URLs, and page content
+function detectAuthSurfaces(forms, urls, html) {
+  const surfaces = [];
+
+  // Check forms for auth patterns
+  if (forms) {
+    for (const form of forms) {
+      if (form.hasPassword) {
+        surfaces.push({
+          type: "login_form",
+          detail: `${form.method} ${form.action || "(self)"}`,
+          risk: "high",
+          why: "Password field found - test default creds, brute force, SQLi in login"
+        });
+      }
+    }
+  }
+
+  // Check URLs for auth-related paths
+  const authPaths = /\b(login|signin|sign-in|auth|oauth|sso|saml|jwt|register|signup|sign-up|forgot|reset-password|2fa|mfa|token|session|api[-_]?key)\b/i;
+  const seen = new Set();
+  for (const url of (urls || [])) {
+    if (authPaths.test(url)) {
+      const path = url.replace(/https?:\/\/[^\/]+/, "").split("?")[0];
+      if (!seen.has(path)) {
+        seen.add(path);
+        surfaces.push({
+          type: "auth_endpoint",
+          detail: url.length > 120 ? url.slice(0, 120) + "…" : url,
+          risk: "medium",
+          why: "Auth-related endpoint - test for bypasses, token leaks, rate limits"
+        });
+      }
+    }
+  }
+
+  // Check HTML for OAuth/SSO integrations
+  if (html) {
+    if (/accounts\.google\.com|googleapis\.com\/auth/i.test(html)) surfaces.push({ type: "oauth", detail: "Google OAuth", risk: "medium", why: "Test OAuth misconfiguration, redirect_uri manipulation" });
+    if (/graph\.facebook\.com|facebook\.com\/v\d+/i.test(html)) surfaces.push({ type: "oauth", detail: "Facebook Login", risk: "medium", why: "Test OAuth state parameter, CSRF in OAuth flow" });
+    if (/github\.com\/login\/oauth/i.test(html)) surfaces.push({ type: "oauth", detail: "GitHub OAuth", risk: "medium", why: "Test scope escalation, token leakage" });
+    const ssoMatch = html.match(/cognito|auth0|okta|keycloak/i);
+    if (ssoMatch) surfaces.push({ type: "sso", detail: ssoMatch[0], risk: "medium", why: "Centralised auth provider - check for misconfig, token reuse" });
+  }
+
+  return surfaces.slice(0, 15);
+}
+
+// Extract hardcoded configs, debug flags, and interesting JS globals
+function extractJSConfigs(jsText) {
+  if (!jsText) return [];
+  const configs = [];
+  const patterns = [
+    { rx: /(?:debug|DEBUG|verbose|VERBOSE)\s*[:=]\s*(true|1|"true")/g, type: "debug_flag", why: "Debug mode enabled - may expose stack traces, verbose errors" },
+    { rx: /(?:NODE_ENV|ENVIRONMENT|ENV)\s*[:=]\s*["'`](development|staging|test|dev)["'`]/gi, type: "non_prod_env", why: "Non-production environment flag - likely less hardened" },
+    { rx: /(?:admin|ADMIN)[-_]?(?:URL|PATH|ROUTE|PANEL)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "admin_path", why: "Admin panel path discovered" },
+    { rx: /(?:firebase|supabase|amplify)Config\s*[:=]\s*\{/gi, type: "backend_config", why: "Backend-as-a-Service config exposed - check for public write access" },
+    { rx: /(?:STRIPE|PAYPAL|SQUARE)[-_]?(?:KEY|TOKEN|SECRET)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "payment_config", why: "Payment processor config - check for live vs test keys" },
+    { rx: /(?:ws|wss):\/\/[^"'`\s]+/g, type: "websocket", why: "WebSocket endpoint - test for auth bypass, injection" },
+    { rx: /(?:bucket|BUCKET)[-_]?(?:NAME|URL|PATH)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "storage_bucket", why: "Cloud storage bucket reference - check for public access" },
+    { rx: /(?:SENTRY|DATADOG|NEWRELIC)[-_]?(?:DSN|KEY|TOKEN)\s*[:=]\s*["'`]([^"'`]+)/gi, type: "monitoring", why: "Monitoring service config - may leak internal infra details" },
+  ];
+  for (const { rx, type, why } of patterns) {
+    rx.lastIndex = 0;
+    let m;
+    while ((m = rx.exec(jsText)) !== null) {
+      configs.push({ type, match: m[0].slice(0, 150), why });
+      if (configs.length >= 20) return configs;
+    }
+  }
+  return configs;
+}
+
+// MASTER LEAD GENERATOR - Correlates all findings into prioritised attack leads
+function generateLeads(state) {
+  const leads = [];
+
+  // Lead 1: Exposed sensitive files → direct exploitation
+  if (state.sensitiveFiles?.length) {
+    for (const f of state.sensitiveFiles) {
+      if (f.path.includes('.git')) {
+        leads.push({ priority: 1, category: "Source Code Leak", title: "Git repository exposed", detail: `${f.path} is accessible. Use git-dumper to extract full source code, then search for secrets, hardcoded creds, and business logic flaws.`, action: `git-dumper ${state.url}/.git/ ./dumped-repo` });
+      } else if (f.path.includes('.env')) {
+        leads.push({ priority: 1, category: "Credential Leak", title: "Environment file exposed", detail: `${f.path} accessible. Likely contains DB creds, API keys, and secrets. Fetch and extract immediately.`, action: `curl -s ${new URL(f.path, state.url).href}` });
+      } else if (f.path.includes('swagger') || f.path.includes('graphql')) {
+        leads.push({ priority: 2, category: "API Documentation", title: `API docs at ${f.path}`, detail: "API documentation is publicly accessible. Map all endpoints, test auth requirements, look for IDOR and mass assignment.", action: `Browse: ${new URL(f.path, state.url).href}` });
+      }
+    }
+  }
+
+  // Lead 2: CORS + credentials = account takeover
+  if (state.corsFindings?.length) {
+    const credsCors = state.corsFindings.find(f => f.credentials);
+    if (credsCors) {
+      leads.push({ priority: 1, category: "Account Takeover", title: "CORS allows credentials with reflected origin", detail: "Any origin can make credentialed requests. Build a PoC page that steals user data via cross-origin fetch with credentials:include.", action: "Create attacker page with: fetch(target, {credentials:'include'}).then(r=>r.json()).then(exfil)" });
+    }
+  }
+
+  // Lead 3: Subdomain takeovers = immediate win
+  if (state.subdomainTakeovers?.length) {
+    for (const t of state.subdomainTakeovers) {
+      leads.push({ priority: 1, category: "Subdomain Takeover", title: `Claim ${t.subdomain} on ${t.service}`, detail: `CNAME points to ${t.cname} but service is unclaimed. Register on ${t.service} to take control. Can be used for phishing, cookie theft, or CSP bypass.`, action: `Register ${t.cname} on ${t.service}` });
+    }
+  }
+
+  // Lead 4: Auth surfaces found
+  if (state.authSurfaces?.length) {
+    for (const auth of state.authSurfaces.slice(0, 3)) {
+      leads.push({ priority: auth.risk === "high" ? 2 : 3, category: "Auth Testing", title: auth.type.replace(/_/g, " "), detail: `${auth.detail} — ${auth.why}`, action: auth.detail });
+    }
+  }
+
+  // Lead 5: JS endpoints = hidden attack surface
+  if (state.jsEndpoints?.length) {
+    const adminEps = state.jsEndpoints.filter(e => /admin|internal|debug|config/i.test(e));
+    const apiEps = state.jsEndpoints.filter(e => /api|v\d|graphql/i.test(e));
+    if (adminEps.length) {
+      leads.push({ priority: 2, category: "Hidden Endpoints", title: `${adminEps.length} admin/internal endpoints in JS`, detail: `Found: ${adminEps.slice(0, 5).join(", ")}${adminEps.length > 5 ? "…" : ""}. Test for auth bypass, IDOR, privilege escalation.`, action: adminEps.slice(0, 3).join("\n") });
+    }
+    if (apiEps.length) {
+      leads.push({ priority: 3, category: "API Surface", title: `${apiEps.length} API endpoints discovered in JS`, detail: `Found: ${apiEps.slice(0, 5).join(", ")}${apiEps.length > 5 ? "…" : ""}. Fuzz parameters, test auth, check for IDOR.`, action: apiEps.slice(0, 5).join("\n") });
+    }
+  }
+
+  // Lead 6: Parameters for injection
+  if (state.discoveredParams?.length) {
+    const injectable = state.discoveredParams.filter(p =>
+      /id|user|name|query|search|q|url|redirect|file|path|page|callback|token|ref|sort|order|filter|lang|type/i.test(p.name)
+    );
+    if (injectable.length) {
+      leads.push({ priority: 2, category: "Injection Points", title: `${injectable.length} potentially injectable parameters`, detail: `High-interest params: ${injectable.slice(0, 8).map(p => p.name).join(", ")}. Test for SQLi, XSS, SSRF, path traversal, and IDOR.`, action: injectable.slice(0, 5).map(p => `${p.name}=${p.examples[0] || "FUZZ"}`).join("&") });
+    }
+  }
+
+  // Lead 7: JS configs (debug, non-prod, admin paths)
+  if (state.jsConfigs?.length) {
+    for (const cfg of state.jsConfigs.slice(0, 3)) {
+      leads.push({ priority: cfg.type === "debug_flag" || cfg.type === "non_prod_env" ? 2 : 3, category: "JS Config Leak", title: cfg.type.replace(/_/g, " "), detail: `${cfg.match} — ${cfg.why}`, action: cfg.match });
+    }
+  }
+
+  // Lead 8: High-severity CVEs with known exploits
+  const allCves = [];
+  for (const [ip, data] of Object.entries(state.perIp || {})) {
+    for (const cve of (data.cve_enrich || [])) {
+      if (Number(cve.score) >= 8) allCves.push({ ...cve, ip });
+    }
+  }
+  if (allCves.length) {
+    leads.push({ priority: 2, category: "Known Vulnerabilities", title: `${allCves.length} high-severity CVEs (CVSS ≥ 8)`, detail: allCves.slice(0, 5).map(c => `${c.id} (${c.score}) on ${c.ip}`).join(", "), action: `searchsploit ${allCves[0].id}` });
+  }
+
+  // Lead 9: Dangerous HTTP methods
+  if (state.httpMethods?.risky && Array.isArray(state.httpMethods.dangerous) && state.httpMethods.dangerous.length) {
+    leads.push({ priority: 3, category: "HTTP Methods", title: `Dangerous methods: ${state.httpMethods.dangerous.join(", ")}`, detail: "PUT/DELETE may allow file upload or resource modification. Test with curl.", action: `curl -X PUT ${state.url || "TARGET"}/test.txt -d "pwned"` });
+  }
+
+  // Lead 10: Missing security headers → XSS potential
+  const headers = state.headers || {};
+  if (!headers["content-security-policy"] && !headers["x-frame-options"]) {
+    leads.push({ priority: 3, category: "XSS/Clickjacking", title: "No CSP or X-Frame-Options", detail: "Page can be framed and has no CSP. Test for reflected/stored XSS and clickjacking.", action: `<iframe src="${state.url}"></iframe>` });
+  }
+
+  // Lead 11: Insecure cookies
+  if (Array.isArray(state.cookieSecurity) && state.cookieSecurity.some(c => c.issues?.length > 0 && !c.httpOnly)) {
+    const vulnCookies = state.cookieSecurity.filter(c => !c.httpOnly);
+    if (vulnCookies.length) {
+      leads.push({ priority: 3, category: "Session Hijacking", title: `${vulnCookies.length} cookies accessible via JavaScript`, detail: `Cookies without HttpOnly: ${vulnCookies.map(c => c.name).join(", ")}. If XSS exists, these can be stolen.`, action: "document.cookie" });
+    }
+  }
+
+  // Sort by priority (1=critical, 2=high, 3=medium)
+  leads.sort((a, b) => a.priority - b.priority);
+  return leads.slice(0, 15);
+}
+
 // Form Analysis - Identify input fields and sensitive forms
 function analyzeForms(html) {
   const forms = [];
@@ -625,6 +1190,7 @@ function analyzeForms(html) {
 
     const inputs = [];
     let inputMatch;
+    inputRx.lastIndex = 0;
     while ((inputMatch = inputRx.exec(formHTML)) !== null) {
       const inputHTML = inputMatch[0];
       const type = (inputHTML.match(/type=["']([^"']+)["']/i) || [])[1] || 'text';
@@ -642,7 +1208,7 @@ function analyzeForms(html) {
       inputs: inputs.length,
       hasPassword,
       hasHidden,
-      sensitive: hasPassword || method.toUpperCase() === 'GET' && hasPassword
+      sensitive: hasPassword || (method.toUpperCase() === 'GET' && hasHidden)
     });
   }
 
@@ -725,29 +1291,44 @@ function analyzeCookies(headers) {
   return analysis;
 }
 
-// JavaScript Library Detection with CVE mapping
-function detectJSLibraries(html, scripts) {
+// JavaScript Library Detection - scans script URLs and HTML for library references
+// Note: `scripts` is an array of script URLs (not content), so patterns match URL paths
+function detectJSLibraries(html, scriptUrls) {
   const libraries = [];
-  const allContent = html + ' ' + (scripts || []).join(' ');
+  const seen = new Set();
+  // Combine script URLs and HTML meta/link references for matching
+  const urlsStr = (scriptUrls || []).join(' ');
 
+  // Patterns tuned for URL path matching (e.g., "/jquery-3.6.0.min.js")
   const libPatterns = [
-    { name: 'jQuery', rx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+)|min)/i },
-    { name: 'Angular', rx: /angular(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'React', rx: /react(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Vue', rx: /vue(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Bootstrap', rx: /bootstrap(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Lodash', rx: /lodash(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'Moment.js', rx: /moment(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i },
-    { name: 'D3', rx: /d3(?:[\/\-\.](?:v?(\d+\.\d+\.\d+)))?/i }
+    { name: 'jQuery', urlRx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /jquery[\/\-\.](?:v?(\d+\.\d+\.\d+))/i },
+    { name: 'Angular', urlRx: /angular(?:js)?[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /ng-app|ng-controller/i },
+    { name: 'React', urlRx: /react(?:-dom)?[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /data-reactroot|data-reactid|__NEXT_DATA__/i },
+    { name: 'Vue', urlRx: /vue[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: /data-v-[a-f0-9]|__vue__/i },
+    { name: 'Bootstrap', urlRx: /bootstrap[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Lodash', urlRx: /lodash[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Moment.js', urlRx: /moment[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'D3', urlRx: /d3[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Axios', urlRx: /axios[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null },
+    { name: 'Three.js', urlRx: /three[\/\-\.](?:v?(\d+\.\d+\.\d+))/i, htmlRx: null }
   ];
 
   for (const lib of libPatterns) {
-    const match = allContent.match(lib.rx);
-    if (match) {
-      libraries.push({
-        name: lib.name,
-        version: match[1] || 'unknown'
-      });
+    if (seen.has(lib.name)) continue;
+    // Check URLs first (more reliable for version extraction)
+    const urlMatch = urlsStr.match(lib.urlRx);
+    if (urlMatch) {
+      seen.add(lib.name);
+      libraries.push({ name: lib.name, version: urlMatch[1] || 'detected' });
+      continue;
+    }
+    // Fallback: check HTML for DOM markers (no version available)
+    if (lib.htmlRx) {
+      const htmlMatch = html.match(lib.htmlRx);
+      if (htmlMatch) {
+        seen.add(lib.name);
+        libraries.push({ name: lib.name, version: 'detected' });
+      }
     }
   }
 
@@ -778,8 +1359,8 @@ const SECRET_PATTERNS=[
   // Discord
   {id:"discord_token", rx:/[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g},
   {id:"discord_webhook", rx:/https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d{17,19}\/[A-Za-z0-9_\-]{68}/g},
-  // Telegram
-  {id:"telegram_bot", rx:/\b\d{8,10}:[A-Za-z0-9_\-]{35}\b/g},
+  // Telegram (require "bot" context to reduce false positives)
+  {id:"telegram_bot", rx:/(?:bot|telegram|tg)[\s:=]*\d{8,10}:[A-Za-z0-9_\-]{35}/gi},
   // Payment Processors
   {id:"stripe_key", rx:/(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,99}/g},
   {id:"paypal_braintree", rx:/access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}/g},
@@ -808,24 +1389,21 @@ const SECRET_PATTERNS=[
   // Private Keys
   {id:"private_key", rx:/-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP|PRIVATE) (?:PRIVATE )?KEY-----/g},
   {id:"ssh_key", rx:/ssh-rsa\s+AAAA[0-9A-Za-z+\/]+[=]{0,3}/g},
-  // Crypto & Blockchain
-  {id:"ethereum_key", rx:/0x[a-fA-F0-9]{64}/g},
-  {id:"bitcoin_address", rx:/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g},
-  // Network & Infrastructure
-  {id:"internal_ip", rx:/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g},
-  {id:"ipv6_address", rx:/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g},
-  // API Endpoints & Routes
-  {id:"endpoint_url", rx:/https?:\/\/[a-z0-9\.\-]+(?::\d{2,5})?(?:\/[A-Za-z0-9_\-\.~%\/\?\=\&#]+)?/gi},
+  // Crypto & Blockchain (tightened to reduce false positives)
+  {id:"ethereum_private_key", rx:/(?:private[-_]?key|PRIVATE[-_]?KEY|eth[-_]?key)[\s:=]+["']?0x[a-fA-F0-9]{64}["']?/gi},
+  // Network & Infrastructure (only flag internal IPs when embedded in config-like contexts)
+  {id:"internal_ip", rx:/(?:["'=:]\s*)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?=["'\s;,\]}])/g},
+  // API Endpoints & Routes (only match routes with sensitive path segments, NOT all URLs)
   {id:"api_route", rx:/(?:^|[^a-z])\/(?:api|v\d+|graphql|admin|internal|wp-json)\/[A-Za-z0-9_\-\/\.]+/gi},
   {id:"api_key_assign", rx:/(?:api[_-]?key|apikey|token|secret|password|passwd|bearer|auth)[\s]*[:=][\s]*["'][^"']{8,}["']/gi},
   // Additional Secrets
   {id:"npm_token", rx:/npm_[A-Za-z0-9]{36}/g},
   {id:"pypi_token", rx:/pypi-[A-Za-z0-9\-_]{32,}/g},
   {id:"docker_hub_token", rx:/dckr_pat_[A-Za-z0-9_-]{32,}/g},
-  {id:"datadog_key", rx:/[a-f0-9]{32}(?:-[a-f0-9]{8})?/g}
+  {id:"datadog_api_key", rx:/(?:DATADOG|DD)[-_]?(?:API[-_]?KEY|APP[-_]?KEY)[\s:=]+["']?[a-f0-9]{32}["']?/gi}
 ];
 function scanText(t){ const out=[]; for(const {id,rx} of SECRET_PATTERNS){ try{ rx.lastIndex=0; const m=t.match(rx); if(m&&m.length) out.push({id, samples: Array.from(new Set(m)).slice(0,5)});}catch{}} return out; }
-async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await r.text(); return t.slice(0, 300*1024);}catch{ return ""; } }
+async function fetchText(url){ try{ const r=await fetchWithTimeout(url,{},2500); if(!r.ok) return ""; const ct=r.headers.get("content-type")||""; if(!/javascript|json|text|xml|html/.test(ct)) return ""; const t=await Promise.race([r.text(), new Promise((_,rej)=>setTimeout(()=>rej(new Error("body read timeout")),5000))]); return t.slice(0, 300*1024);}catch(e){ log(`fetchText(${url}) failed:`, e.message); return ""; } }
 const scannedByTab=new Map();
 async function probeSourceMaps(urls){
   const out=[];
@@ -837,9 +1415,23 @@ async function runSecretsScan(tabId, state, resources, origin){
   const results = state.secrets ? [...state.secrets] : [];
   const inline = Array.isArray(resources?.inlineScripts)? resources.inlineScripts : [];
   const external = Array.isArray(resources?.externalScripts)? resources.externalScripts.slice(0,12) : [];
+  // Inline scripts (fast, no I/O)
   for(const chunk of inline){ const f=scanText(chunk); if(f.length) results.push({source:"inline_script", findings:f}); if(results.length>=20) break; }
-  for(const url of external){ if(scanned.has(url)) continue; scanned.add(url); const text=await fetchText(url); if(!text) continue; const f=scanText(text); if(f.length) results.push({source:url, findings:f}); if(results.length>=20) break; }
-  if(!scanned.has("__HTML__") && origin){ scanned.add("__HTML__"); try{ const r=await fetchWithTimeout(origin,{},2500); if(r.ok){ const ct=r.headers.get("content-type")||""; if(/text\/html/i.test(ct)){ const html=(await r.text()).slice(0,200*1024); const f=scanText(html); if(f.length) results.push({source:"document_html", findings:f}); } } }catch{} }
+  // External scripts - fetch in parallel batches of 4 for speed
+  const toFetch = external.filter(url => !scanned.has(url));
+  toFetch.forEach(url => scanned.add(url));
+  for (let i = 0; i < toFetch.length && results.length < 20; i += 4) {
+    const batch = toFetch.slice(i, i + 4);
+    const texts = await Promise.all(batch.map(url => fetchText(url)));
+    for (let j = 0; j < batch.length; j++) {
+      if (!texts[j]) continue;
+      const f = scanText(texts[j]);
+      if (f.length) results.push({ source: batch[j], findings: f });
+      if (results.length >= 20) break;
+    }
+  }
+  // HTML document scan
+  if(!scanned.has("__HTML__") && origin){ scanned.add("__HTML__"); try{ const r=await fetchWithTimeout(origin,{},2500); if(r.ok){ const ct=r.headers.get("content-type")||""; if(/text\/html/i.test(ct)){ const html=(await r.text()).slice(0,200*1024); const f=scanText(html); if(f.length) results.push({source:"document_html", findings:f}); } } }catch(e){ log(`HTML secrets scan failed:`, e.message); } }
   let favHash = state.faviconHash || null; const fav = resources?.favicon || (origin? new URL("/favicon.ico",origin).href:null); if(!favHash && fav) favHash = await faviconHash(fav);
   const patch = { secrets: results, faviconHash: favHash };
   const next = merge(state, patch); await setTabData(tabId, next); return next;
@@ -921,8 +1513,14 @@ If all should be kept, return all. If none are relevant, return [].`;
       return hosts;
     }
 
-    // Parse AI response
-    const filtered = JSON.parse(response.trim());
+    // Parse AI response safely
+    let filtered;
+    try {
+      filtered = JSON.parse(response.trim());
+    } catch (parseErr) {
+      logError(`AI response was not valid JSON, returning all hosts:`, parseErr.message);
+      return hosts;
+    }
     if (Array.isArray(filtered)) {
       log(`AI filtered ${hosts.length} hosts down to ${filtered.length} relevant ones`);
       return filtered;
@@ -1118,15 +1716,51 @@ async function enrichCVEsForCPE(cpe) {
 
   items.sort((a, b) => (Number(b.score || 0) - Number(a.score || 0)));
   const top = items.slice(0, CONFIG.LIMITS.MAX_CVE_RESULTS / 2);
-  cveCache.set(cpe, top);
+  setBoundedCache(cveCache, cpe, top);
   log(`Cached ${top.length} CVEs for ${cpe}`);
   return top;
 }
 
 // state
-const setTabData = async (tabId, data) => chrome.storage.session.set({ [`tab:${tabId}`]: data });
+async function setTabData(tabId, data) {
+  try {
+    await chrome.storage.session.set({ [`tab:${tabId}`]: data });
+  } catch (e) {
+    if (String(e).includes('QUOTA') || String(e).includes('quota')) {
+      logError(`Storage quota exceeded for tab ${tabId}, pruning old data`);
+      // Trim large fields to fit within quota
+      if (data.secrets?.length > 10) data.secrets = data.secrets.slice(0, 10);
+      if (data.quickSubs?.length > 40) data.quickSubs = data.quickSubs.slice(0, 40);
+      if (data.aiEnhancedSubs?.length > 30) data.aiEnhancedSubs = data.aiEnhancedSubs.slice(0, 30);
+      try { await chrome.storage.session.set({ [`tab:${tabId}`]: data }); } catch (e2) { logError(`Storage set still failed after pruning:`, e2); }
+    } else {
+      logError(`Failed to set tab data for ${tabId}:`, e);
+    }
+  }
+}
 const getTabData = async (tabId) => (await chrome.storage.session.get(`tab:${tabId}`))[`tab:${tabId}`];
-async function patchState(tabId, patch){ const cur=await getTabData(tabId)||{}; const next=merge(cur,patch); await setTabData(tabId,next); return next; }
+// Proper mutex: each key has a chain of promises; new callers always
+// append to the tail, guaranteeing serialised execution without TOCTOU gaps.
+const patchQueues = new Map();
+async function patchState(tabId, patch){
+  const key = `tab:${tabId}`;
+  const prev = patchQueues.get(key) || Promise.resolve();
+  let releaseLock;
+  const gate = new Promise(r => { releaseLock = r; });
+  // Atomically replace the tail with our gate *before* awaiting
+  patchQueues.set(key, gate);
+  try {
+    await prev; // wait for preceding patch to finish
+    const cur = await getTabData(tabId) || {};
+    const next = merge(cur, patch);
+    await setTabData(tabId, next);
+    return next;
+  } finally {
+    // If this was the last in the chain, clean up the key
+    if (patchQueues.get(key) === gate) patchQueues.delete(key);
+    releaseLock();
+  }
+}
 
 // Technology detection - Comprehensive fingerprinting from headers, meta tags, and DOM hints
 function detectTech({headers={}, meta={}, domHints={}, faviconHash}){
@@ -1279,6 +1913,16 @@ function deriveHighlights(state){
   // Secrets
   if(secrets.length) items.push({ severity:"high", title:"Potential secrets/endpoints", detail:`${secrets.length} sources flagged` });
 
+  // Subdomain Takeover
+  if(state.subdomainTakeovers && state.subdomainTakeovers.length > 0) {
+    items.push({ severity:"critical", title:"Subdomain takeover possible", detail: state.subdomainTakeovers.map(t => `${t.subdomain} → ${t.service}`).join(", ") });
+  }
+
+  // Wayback URLs
+  if(state.waybackUrls && state.waybackUrls.length > 0) {
+    items.push({ severity:"low", title:`${state.waybackUrls.length} historical URLs from Wayback Machine`, detail: "May reveal old endpoints, parameters, or forgotten pages" });
+  }
+
   // Intel Extraction
   if(state.intel) {
     if(state.intel.emails && state.intel.emails.length > 0) {
@@ -1315,6 +1959,16 @@ function deriveHighlights(state){
   return { items: items.slice(0, 12) };
 }
 
+// Regenerate leads when new data arrives (called alongside highlights)
+async function refreshLeads(tabId) {
+  try {
+    const state = await getTabData(tabId);
+    if (!state) return;
+    const leads = generateLeads(state);
+    if (leads.length) await patchState(tabId, { leads });
+  } catch (e) { logError("Lead refresh failed:", e); }
+}
+
 function scheduleHighlights(tabId){
   if(highlightTimers.has(tabId)) return;
   const timer = setTimeout(async()=>{
@@ -1323,6 +1977,11 @@ function scheduleHighlights(tabId){
       const state = await getTabData(tabId);
       const highlights = deriveHighlights(state);
       if(highlights) await patchState(tabId, { highlights });
+      // Also refresh leads with latest data
+      await refreshLeads(tabId);
+      // Accumulate findings into persistent domain store
+      const domain = tabDomainMap.get(tabId) || state?.domain;
+      if (domain) accumulateToDomain(domain, state).catch(e => logError("Domain accumulation failed:", e));
     }catch(e){ logError("Highlight generation failed", e); }
   }, 400);
   highlightTimers.set(tabId, timer);
@@ -1337,6 +1996,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         resourcesByTab.set(sender.tab.id, msg);
         const base = await getTabData(sender.tab.id);
         if (base) {
+          // Store page title for browsing breadcrumb trail
+          if (msg.pageTitle) await patchState(sender.tab.id, { pageTitle: msg.pageTitle });
           try {
             const fav = base.faviconHash;
             const tech = detectTech({ headers: base.headers || {}, meta: msg.meta || {}, domHints: msg.domHints || {}, faviconHash: fav });
@@ -1373,10 +2034,78 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await patchState(sender.tab.id, { secrets: merged });
             scheduleHighlights(sender.tab.id);
           }
+
+          // JS deep analysis: endpoints, configs, auth surfaces, parameters
+          (async () => {
+            try {
+              const allJS = (msg.inlineScripts || []).join("\n");
+              // Also fetch external scripts for endpoint extraction
+              const extTexts = await Promise.all(
+                (msg.externalScripts || []).slice(0, 8).map(u => fetchText(u))
+              );
+              const combinedJS = allJS + "\n" + extTexts.join("\n");
+              const combinedHTML = msg.htmlSample || "";
+
+              const jsEndpoints = extractJSEndpoints(combinedJS);
+              const jsConfigs = extractJSConfigs(combinedJS);
+              const currentState = await getTabData(sender.tab.id);
+              const authSurfaces = detectAuthSurfaces(
+                currentState?.forms,
+                [...jsEndpoints, ...(currentState?.waybackUrls || [])],
+                combinedHTML + combinedJS
+              );
+
+              // Extract params from wayback URLs + JS endpoints
+              const allUrls = [
+                ...(currentState?.waybackAll || []),
+                ...jsEndpoints.filter(e => e.includes("?"))
+              ];
+              const discoveredParams = extractParameters(allUrls);
+
+              await patchState(sender.tab.id, {
+                jsEndpoints,
+                jsConfigs,
+                authSurfaces,
+                discoveredParams
+              });
+
+              // Generate leads from all collected data
+              const latestState = await getTabData(sender.tab.id);
+              const leads = generateLeads(latestState);
+              await patchState(sender.tab.id, { leads });
+              scheduleHighlights(sender.tab.id);
+              log(`Lead generation complete: ${leads.length} leads, ${jsEndpoints.length} endpoints, ${discoveredParams.length} params`);
+            } catch (e) {
+              logError("JS deep analysis failed:", e);
+            }
+          })().catch(e => logError("JS deep analysis unhandled:", e));
         }
         sendResponse({ ok: true });
       } else if (msg?.type === "getState") {
-        sendResponse(await getTabData(msg.tabId));
+        const tabData = await getTabData(msg.tabId);
+        // Attach domain stats for the popup to show
+        if (tabData?.domain) {
+          const domData = await getDomainData(tabData.domain);
+          if (domData) {
+            tabData._domainStats = {
+              totalPages: domData.pagesVisited?.length || 0,
+              totalEndpoints: domData.jsEndpoints?.length || 0,
+              totalSecrets: domData.allSecrets?.length || 0,
+              totalEmails: domData.allEmails?.length || 0,
+              totalForms: domData.allForms?.length || 0,
+              totalTech: domData.allTech?.length || 0,
+              firstSeen: domData.firstSeen,
+              pagesVisited: (domData.pagesVisited || []).slice(-20)
+            };
+            // Include request log
+            const reqLog = requestLogByDomain.get(tabData.domain) || [];
+            tabData._requestLog = reqLog.slice(-50);
+          }
+        }
+        sendResponse(tabData);
+      } else if (msg?.type === "getDomainState") {
+        // Full domain accumulated state for deep inspection
+        sendResponse(await getDomainData(msg.domain));
       } else if (msg?.type === "vtSubdomain") {
         const { sub } = msg;
         const state = await getTabData(msg.tabId);
@@ -1408,10 +2137,32 @@ async function analyze(tabId, url){
     const u=new URL(url); if(!/^https?:$/.test(u.protocol)) return;
     const domain=u.hostname;
 
+    // Track which domain this tab is browsing
+    tabDomainMap.set(tabId, domain);
+
     let hdrSnap = pickSecurityHeaders(tabId);
     if(!hdrSnap){ try{ const h=await fetchHeadersFallback(url); if(h) hdrSnap={url, headers:h}; }catch{} }
 
-    await setTabData(tabId, { url, domain, headers: hdrSnap?hdrSnap.headers:{}, ts: Date.now() });
+    // Load existing domain data to preserve cross-page accumulation
+    const domainData = await getDomainData(domain);
+    const preserved = {};
+    if (domainData) {
+      // Carry forward accumulated fields so they're visible in tab view
+      if (domainData.jsEndpoints?.length) preserved.jsEndpoints = domainData.jsEndpoints;
+      if (domainData.authSurfaces?.length) preserved.authSurfaces = domainData.authSurfaces;
+      if (domainData.leads?.length) preserved.leads = domainData.leads;
+      if (domainData.waybackUrls?.length) preserved.waybackUrls = domainData.waybackUrls;
+      if (domainData.subdomainTakeovers?.length) preserved.subdomainTakeovers = domainData.subdomainTakeovers;
+      if (domainData.discoveredParams?.length) preserved.discoveredParams = domainData.discoveredParams;
+    }
+
+    await setTabData(tabId, {
+      url, domain,
+      headers: hdrSnap ? hdrSnap.headers : {},
+      ts: Date.now(),
+      pageTitle: null,
+      ...preserved
+    });
     scheduleHighlights(tabId);
 
     // IPs - Resolve and enrich with all available data
@@ -1551,11 +2302,38 @@ async function analyze(tabId, url){
       scheduleHighlights(tabId);
     })();
 
-    // Subdomains
+    // Wayback Machine URL discovery (background)
+    (async () => {
+      try {
+        const wb = await waybackUrls(domain);
+        if (wb.all.length) {
+          await patchState(tabId, { waybackUrls: wb.interesting, waybackAll: wb.all });
+          scheduleHighlights(tabId);
+        }
+      } catch (e) { logError(`Wayback Machine recon failed:`, e); }
+    })();
+
+    // Subdomains + takeover detection
     (async () => {
       const liveSubs = await subdomainsLive(domain);
       await patchState(tabId, { quickSubs: liveSubs });
       scheduleHighlights(tabId);
+
+      // Check for subdomain takeover on subs with CNAMEs (background)
+      const subsWithCnames = liveSubs.filter(s => s.cnames && s.cnames.length > 0);
+      if (subsWithCnames.length) {
+        const takeovers = [];
+        for (const sub of subsWithCnames.slice(0, 20)) {
+          try {
+            const result = await checkSubdomainTakeover(sub.subdomain, sub.cnames);
+            if (result) takeovers.push(result);
+          } catch (e) { log(`Takeover check failed for ${sub.subdomain}:`, e.message); }
+        }
+        if (takeovers.length) {
+          await patchState(tabId, { subdomainTakeovers: takeovers });
+          scheduleHighlights(tabId);
+        }
+      }
     })();
 
     // AI-Enhanced Subdomain Recon (background task)
@@ -1631,3 +2409,17 @@ async function analyze(tabId, url){
   }catch(e){ await setTabData(tabId, { url, error: String(e) }); }
 }
 chrome.tabs.onUpdated.addListener((tabId, info, tab)=>{ if(info.status==="complete" && tab?.url) analyze(tabId, tab.url); });
+
+// Clean up per-tab data when tabs are closed to prevent memory leaks
+chrome.tabs.onRemoved.addListener((tabId) => {
+  headersByTab.delete(tabId);
+  resourcesByTab.delete(tabId);
+  scannedByTab.delete(tabId);
+  patchQueues.delete(`tab:${tabId}`);
+  if (highlightTimers.has(tabId)) {
+    clearTimeout(highlightTimers.get(tabId));
+    highlightTimers.delete(tabId);
+  }
+  chrome.storage.session.remove(`tab:${tabId}`).catch(e => logError(`Failed to clean session for tab ${tabId}:`, e));
+  log(`Cleaned up data for closed tab ${tabId}`);
+});

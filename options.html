@@ -1,13 +1,13 @@
 
 <!doctype html><html><head><meta charset="utf-8"><title>ReconRadar – Options</title>
-<style>body{font:14px system-ui;max-width:720px;margin:24px auto;padding:0 12px}input[type=text]{width:520px;padding:6px}.btn{padding:6px 10px;border:1px solid #222;border-radius:6px;background:#111;color:#fff;cursor:pointer}</style></head>
+<style>body{font:14px system-ui;max-width:720px;margin:24px auto;padding:0 12px}input[type=text],input[type=password]{width:520px;padding:6px}.btn{padding:6px 10px;border:1px solid #222;border-radius:6px;background:#111;color:#fff;cursor:pointer}</style></head>
 <body>
 <h2>SnailSploit Recon – Options</h2>
 <div style="margin-bottom:16px">
-<label>VirusTotal API key: <input id="vt" type="text" placeholder="vt_public_or_premium_key"/></label>
+<label>VirusTotal API key: <input id="vt" type="password" placeholder="vt_public_or_premium_key" autocomplete="off"/></label>
 </div>
 <div style="margin-bottom:16px">
-<label>OpenAI API key (for AI correlation): <input id="openai" type="text" placeholder="sk-..."/></label>
+<label>OpenAI API key (for AI correlation): <input id="openai" type="password" placeholder="sk-..." autocomplete="off"/></label>
 <p style="margin-top:4px;font-size:12px;color:#666">Used for intelligent host filtering and finding correlation. Optional but recommended.</p>
 </div>
 <div style="margin-top:8px">
